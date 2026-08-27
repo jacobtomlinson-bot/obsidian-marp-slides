@@ -126,6 +126,25 @@ test('retains custom themes, Markdown-it engine and Chrome environment handling'
     await fixture.manager.dispose();
 });
 
+test('keeps CHROME_PATH absent when it was not configured', async () => {
+    const fixture = await makeFixture();
+    fixture.settings.CHROME_PATH = '';
+    const previousChrome = process.env.CHROME_PATH;
+    delete process.env.CHROME_PATH;
+    const cli: MarpCliRunner = jest.fn(async () => {
+        expect(process.env.CHROME_PATH).toBeUndefined();
+        return 0;
+    });
+
+    await new MarpExport(fixture.settings, fixture.manager, cli).export(fixture.file, 'html');
+
+    expect(process.env.CHROME_PATH).toBeUndefined();
+    if (previousChrome !== undefined) {
+        process.env.CHROME_PATH = previousChrome;
+    }
+    await fixture.manager.dispose();
+});
+
 test('honors custom output paths for PDF, PPTX and PNG but not HTML', async () => {
     const fixture = await makeFixture();
     fixture.settings.EXPORT_PATH = join(testRoot, 'exports with spaces');

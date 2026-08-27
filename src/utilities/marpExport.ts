@@ -102,10 +102,19 @@ export class MarpExport {
             const queuedRun = marpRunQueue.then(async () => {
                 const { CHROME_PATH } = process.env;
                 try {
-                    process.env.CHROME_PATH = this.settings.CHROME_PATH || CHROME_PATH;
+                    const configuredChromePath = this.settings.CHROME_PATH || CHROME_PATH;
+                    if (configuredChromePath === undefined) {
+                        delete process.env.CHROME_PATH;
+                    } else {
+                        process.env.CHROME_PATH = configuredChromePath;
+                    }
                     await this.runMarpCli(argv, resourcesPath, baseUrl);
                 } finally {
-                    process.env.CHROME_PATH = CHROME_PATH;
+                    if (CHROME_PATH === undefined) {
+                        delete process.env.CHROME_PATH;
+                    } else {
+                        process.env.CHROME_PATH = CHROME_PATH;
+                    }
                 }
             });
             marpRunQueue = queuedRun.catch(() => undefined);

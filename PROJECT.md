@@ -9,7 +9,7 @@
 | Property | Value |
 |----------|-------|
 | Plugin ID | `marp-slides` |
-| Version | 0.45.6 |
+| Version | 0.46.1 |
 | Author | Samuele Cozzi |
 | License | MIT |
 | Min Obsidian Version | 0.15.0 |
@@ -37,6 +37,10 @@
 │                     │     FilePath     │                       │
 │                     │   (Utilities)    │                       │
 │                     └──────────────────┘                       │
+│                                                                 │
+│  Preview and export both consume snapshots owned by             │
+│  WorkingCopyManager; vault notes are never used as writable     │
+│  Marp inputs.                                                    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -45,16 +49,18 @@
 **Preview Pipeline:**
 1. User opens Markdown file and triggers "Slide Preview" command
 2. `MarpSlides` retrieves active `MarkdownView` and creates `MarpPreviewView`
-3. `MarpPreviewView` uses Marp Core to render Markdown → HTML/CSS
-4. Rendered slides displayed in split pane with file base path for assets
-5. File change events trigger re-render automatically
+3. `WorkingCopyManager` writes a converted, unique snapshot outside the vault
+4. `MarpPreviewView` reads that snapshot and uses Marp Core to render Markdown → HTML/CSS
+5. Rendered slides use the original note or vault base path for assets
+6. Modify, file-open, rename, and delete events refresh or clear the preview; generation checks discard late work
 
 **Export Pipeline:**
 1. User triggers export command (PDF/HTML/PPTX/PNG)
-2. `MarpSlides` creates `MarpExport` instance with current settings
-3. `FilePath` resolves file paths, themes, and resources
-4. `MarpExport` constructs CLI arguments and invokes Marp CLI
+2. The shared `WorkingCopyManager` snapshots and converts the current note
+3. `FilePath` resolves the original resource base, themes, and explicit user-visible output path
+4. The shared `MarpExport` invokes Marp CLI with the temporary input and original base URL
 5. Marp CLI uses Chrome/Chromium for PDF/PPTX rendering
+6. The operation removes its owned temporary directory in `finally`, on success or failure
 
 ---
 
@@ -70,12 +76,16 @@ obsidian-marp-slides/
 │   │   ├── settings.ts              # Settings interface and defaults
 │   │   ├── marpExport.ts            # Export functionality (PDF, HTML, PPTX, PNG)
 │   │   ├── filePath.ts              # File/path resolution utilities
+│   │   ├── workingCopy.ts           # Isolated temporary Markdown snapshots
 │   │   ├── libs.ts                  # External library management
 │   │   └── icons.ts                 # SVG icon definitions
 │   └── views/
 │       └── marpPreviewView.ts       # Slide preview rendering
 ├── tests/
-│   ├── filePath.test.ts             # Path utility tests
+│   ├── filePath.test.ts             # Path and wiki-image conversion tests
+│   ├── workingCopy.test.ts           # Isolation, immutability, and cleanup tests
+│   ├── marpExport.test.ts            # Export parity and failure tests
+│   ├── marpPreviewView.test.ts       # Preview refresh and race tests
 │   └── __mocks__/
 │       └── obsidian.ts              # Obsidian API mocks
 ├── docs/                            # User documentation
@@ -95,7 +105,7 @@ obsidian-marp-slides/
 
 ## Core Components
 
-### MarpSlides (`src/main.ts:10-147`)
+### MarpSlides (`src/main.ts`)
 
 Main plugin class extending Obsidian's `Plugin`.
 
@@ -103,17 +113,17 @@ Main plugin class extending Obsidian's `Plugin`.
 - Plugin lifecycle management (`onload`, `onunload`)
 - Command registration (preview, export)
 - Settings management
-- Event listeners (file changes, cursor position)
+- Shared working-copy/export lifecycle
+- Event listeners (modify, open, rename, delete, cursor position)
 
 **Key Methods:**
-| Method | Line | Description |
-|--------|------|-------------|
-| `onload()` | 16 | Initializes plugin, registers views/commands |
-| `loadSettings()` | 90 | Loads persisted settings |
-| `saveSettings()` | 94 | Persists settings to disk |
-| `showPreviewSlide()` | 112 | Opens preview pane |
-| `exportFile()` | 104 | Triggers export operation |
-| `onChange()` | 98 | Handles file modification events |
+| Method | Description |
+|--------|-------------|
+| `onload()` | Initializes shared services and registers views, commands, and events |
+| `showPreviewSlide()` | Opens and initializes the preview pane |
+| `exportFile()` | Exports the active note through the shared exporter |
+| `onChange()` | Refreshes the displayed note after modification |
+| `onFileOpen()` | Switches or clears preview state with the active note |
 
 **Registered Commands:**
 - `marp-slides:preview` - Slide Preview
@@ -125,26 +135,29 @@ Main plugin class extending Obsidian's `Plugin`.
 
 ---
 
-### MarpPreviewView (`src/views/marpPreviewView.ts:16-166`)
+### MarpPreviewView (`src/views/marpPreviewView.ts`)
 
 Custom view for rendering slides, extending Obsidian's `ItemView`.
 
 **Responsibilities:**
 - Marp Core initialization and configuration
 - Theme loading from vault
-- Slide rendering (Markdown → HTML)
+- Working-copy refresh and slide rendering (Markdown → HTML)
+- Generation-based stale refresh rejection
+- Working-copy cleanup on switch, failure, clear, and close
 - Cursor-to-slide synchronization
 - Export action buttons
 
 **Key Methods:**
-| Method | Line | Description |
-|--------|------|-------------|
-| `onOpen()` | 58 | Initializes container, loads themes |
-| `displaySlides()` | 131 | Renders Markdown to HTML slides |
-| `onLineChanged()` | 89 | Scrolls to slide based on cursor |
-| `addActions()` | 97 | Adds export buttons to view header |
+| Method | Description |
+|--------|-------------|
+| `onOpen()` | Initializes the container and loads themes |
+| `displaySlides()` | Refreshes the working copy and renders it when its generation is current |
+| `clear()` / `onClose()` | Invalidates state and releases the displayed working copy |
+| `onLineChanged()` | Scrolls to a slide based on the cursor |
+| `addActions()` | Adds guarded export buttons to the view header |
 
-**Marp Configuration** (lines 29-40):
+**Marp Configuration:**
 ```typescript
 new Marp({
     container: { tag: 'div', id: '__marp-vscode' },
@@ -159,22 +172,24 @@ new Marp({
 
 ---
 
-### MarpExport (`src/utilities/marpExport.ts:8-158`)
+### MarpExport (`src/utilities/marpExport.ts`)
 
 Handles exporting presentations to various formats.
 
 **Responsibilities:**
 - Building Marp CLI argument arrays
+- Creating and cleaning one-shot temporary inputs
+- Preserving the original asset base URL and export destination
 - Managing export types and options
 - Browser path resolution
-- Error handling for missing Chrome
+- Serialized process-global CLI state and surfaced failures
 
 **Key Methods:**
-| Method | Line | Description |
-|--------|------|-------------|
-| `export()` | 16 | Main export orchestrator |
-| `run()` | 101 | Sets up environment and executes CLI |
-| `runMarpCli()` | 136 | Executes Marp CLI with arguments |
+| Method | Description |
+|--------|-------------|
+| `export()` | Creates an operation snapshot, invokes Marp, and cleans in `finally` |
+| `run()` | Serializes process-global environment changes around the CLI call |
+| `runMarpCli()` | Executes Marp CLI with the original resource base URL |
 
 **Supported Export Types:**
 | Type | CLI Flags | Output |
@@ -184,28 +199,45 @@ Handles exporting presentations to various formats.
 | `pptx` | `--pptx` | PowerPoint file |
 | `png` | `--images --png` | PNG images |
 | `html` | `--html --template [mode]` | HTML file |
-| `preview` | `--html --preview` | Live preview server |
+| `preview` | `--html --preview` | Opens generated HTML in a browser |
 
 ---
 
-### FilePath (`src/utilities/filePath.ts:4-112`)
+### WorkingCopyManager (`src/utilities/workingCopy.ts`)
+
+Creates collision-safe, per-refresh Markdown snapshots beneath a random
+plugin-owned directory in the operating system's temporary directory. It
+converts resolvable Obsidian image embeds only in those snapshots, tracks exact
+ownership for safe cleanup, and never writes, renames, copies, or removes the
+source vault note.
+
+Preview snapshots remain alive only while displayed. Export snapshots remain
+alive only until the awaited Marp CLI call settles. A new directory per refresh
+also prevents late writes or notes with identical basenames from colliding.
+
+---
+
+### FilePath (`src/utilities/filePath.ts`)
 
 Utility class for file and path resolution.
 
 **Responsibilities:**
 - Vault base path resolution
 - Absolute vs relative link format handling
+- Original-note base URL and output-path resolution
+- Obsidian image embed conversion with URL-safe paths
 - Theme directory resolution
 - Plugin directory management
 
 **Key Methods:**
-| Method | Line | Description |
-|--------|------|-------------|
-| `getCompleteFileBasePath()` | 41 | Gets resource base path for assets |
-| `getCompleteFilePath()` | 56 | Gets full file path for export |
-| `getThemePath()` | 80 | Resolves custom theme directory |
-| `getLibDirectory()` | 99 | Gets markdown-it plugins directory |
-| `getMarpEngine()` | 106 | Gets Marp engine config path |
+| Method | Description |
+|--------|-------------|
+| `getCompleteFileBasePath()` | Gets the Obsidian preview resource base |
+| `getSourceFilePath()` | Gets the original note's physical path without relocating it |
+| `getMarpBaseUrl()` | Keeps relative resources based at the source folder or vault root |
+| `getExportPath()` | Directs output away from the temporary input directory |
+| `convertImageWikiLinks()` | Converts only resolved image embeds in a supplied snapshot |
+| `getThemePath()` | Resolves custom theme directory |
 
 ---
 
@@ -258,7 +290,7 @@ Manages external markdown-it plugin libraries.
 
 ---
 
-### LineSelectionListener (`src/main.ts:255-300`)
+### LineSelectionListener (`src/main.ts`)
 
 Experimental feature for cursor-to-slide synchronization.
 

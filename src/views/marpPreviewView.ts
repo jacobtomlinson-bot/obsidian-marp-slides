@@ -160,10 +160,28 @@ export class MarpPreviewView extends ItemView  {
         }
 
         const generation = ++this.renderGeneration;
+        const switchingNotes =
+            (this.file !== undefined && !this.sameFile(this.file, view.file)) ||
+            (this.requestedFile !== undefined && !this.sameFile(this.requestedFile, view.file));
+        const retiredCopy = switchingNotes ? this.workingCopy : undefined;
+
+        // Disable toolbar exports synchronously when a different note is
+        // requested. An async refresh must never leave the old note selectable.
+        if (switchingNotes) {
+            this.file = undefined;
+            this.workingCopy = undefined;
+        }
         this.requestedFile = view.file;
         let nextCopy: WorkingCopy | undefined;
 
         try {
+            if (retiredCopy !== undefined) {
+                await this.workingCopies.cleanup(retiredCopy);
+            }
+            if (generation !== this.renderGeneration) {
+                return;
+            }
+
             nextCopy = await this.workingCopies.create(view.file, view.data);
             const processedMarkdown = await this.workingCopies.read(nextCopy);
 
@@ -208,9 +226,16 @@ export class MarpPreviewView extends ItemView  {
                 await this.workingCopies.cleanup(nextCopy);
             }
             if (generation === this.renderGeneration) {
+                const staleCopy = this.workingCopy;
+                this.workingCopy = undefined;
+                this.file = undefined;
+                this.requestedFile = undefined;
                 const container = this.containerEl.children[1];
                 container.empty();
                 container.createEl('p', { text: `Unable to refresh Marp preview: ${this.errorMessage(error)}` });
+                if (staleCopy !== undefined) {
+                    await this.workingCopies.cleanup(staleCopy);
+                }
             }
             throw error;
         }
@@ -228,5 +253,9 @@ export class MarpPreviewView extends ItemView  {
 
     private errorMessage(error: unknown): string {
         return error instanceof Error ? error.message : String(error);
+    }
+
+    private sameFile(left: TFile, right: TFile): boolean {
+        return left === right || left.path === right.path;
     }
 }

@@ -166,3 +166,48 @@ test('working-copy failures clear stale preview output and reject to the caller'
     expect(container.innerHTML).toContain('Unable to refresh Marp preview');
     expect(container.innerHTML).not.toContain('stale preview');
 });
+
+test('a deferred failed note switch cannot export or retain the previous note', async () => {
+    const first = makeFile('one/deck.md');
+    const second = makeFile('two/deck.md');
+    const firstCopy = {
+        directory: '/tmp/first',
+        path: '/tmp/first/deck.md',
+        sourcePath: first.path,
+    };
+    const pendingSwitch = deferred<WorkingCopy>();
+    const cleanup = jest.fn(async () => undefined);
+    const provider: WorkingCopyProvider = {
+        create: jest.fn(async (file) => {
+            if (file === second) {
+                return pendingSwitch.promise;
+            }
+            return firstCopy;
+        }),
+        read: jest.fn(async copy => copy.sourcePath),
+        cleanup,
+    };
+    const exporter = { export: jest.fn(async () => undefined) } as unknown as MarpExport;
+    const { root } = makeContainer();
+    const leaf = {
+        app: { metadataCache: {} } as App,
+        containerEl: root,
+    } as unknown as WorkspaceLeaf;
+    const preview = new MarpPreviewView(DEFAULT_SETTINGS, leaf, provider, exporter);
+
+    await preview.displaySlides(makeView(first, 'first'));
+    const switchResult = preview.displaySlides(makeView(second, 'second'));
+
+    (preview as unknown as { runExport(type: string): void }).runExport('pdf');
+    expect(exporter.export).not.toHaveBeenCalled();
+
+    await Promise.resolve();
+    expect(cleanup).toHaveBeenCalledWith(firstCopy);
+    pendingSwitch.reject(new Error('switch refresh failed'));
+    await expect(switchResult).rejects.toThrow('switch refresh failed');
+
+    (preview as unknown as { runExport(type: string): void }).runExport('pdf');
+    expect(exporter.export).not.toHaveBeenCalled();
+    expect(preview.isDisplaying(first)).toBe(false);
+    expect(preview.isDisplaying(second)).toBe(false);
+});
