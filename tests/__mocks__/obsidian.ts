@@ -31,6 +31,22 @@ export const normalizePath = jest.fn().mockImplementation((str: string) => {
   return normalize(str)
 })
 
+export class ItemView {
+  app: any;
+  containerEl: any;
+
+  constructor(leaf: any) {
+    this.app = leaf.app;
+    this.containerEl = leaf.containerEl;
+  }
+
+  addAction() {}
+}
+
+export const WorkspaceLeaf = jest.fn();
+export const MarkdownView = jest.fn();
+export const Notice = jest.fn();
+
 function normalize (path: string) {
   if (typeof path !== 'string') {
     console.log(path);

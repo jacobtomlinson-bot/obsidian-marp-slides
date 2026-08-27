@@ -1,10 +1,11 @@
-import { MarkdownView, TAbstractFile, Plugin, addIcon, App, PluginSettingTab, Setting, EditorSuggest, EditorPosition, Editor, TFile, EditorSuggestTriggerInfo, EditorSuggestContext  } from 'obsidian';
+import { MarkdownView, TAbstractFile, Plugin, addIcon, App, PluginSettingTab, Setting, EditorSuggest, EditorPosition, Editor, TFile, EditorSuggestTriggerInfo, EditorSuggestContext, Notice  } from 'obsidian';
 
 import { MARP_PREVIEW_VIEW, MarpPreviewView } from './views/marpPreviewView';
 import { MarpExport } from './utilities/marpExport';
 import { ICON_SLIDE_PREVIEW, ICON_EXPORT_PDF, ICON_EXPORT_PPTX, ICON_SLIDE_PRESENT } from './utilities/icons';
 import { Libs } from './utilities/libs';
 import { MarpSlidesSettings, DEFAULT_SETTINGS } from 'utilities/settings';
+import { WorkingCopyManager } from './utilities/workingCopy';
 
 
 export default class MarpSlides extends Plugin {
@@ -12,16 +13,20 @@ export default class MarpSlides extends Plugin {
 	public settings: MarpSlidesSettings;
 	private slidesView : MarpPreviewView;
 	private editorView : MarkdownView | null;
+	private workingCopies: WorkingCopyManager;
+	private exporter: MarpExport;
 
 	async onload() {
 		await this.loadSettings();
+		this.workingCopies = new WorkingCopyManager(this.app, this.settings);
+		this.exporter = new MarpExport(this.settings, this.workingCopies);
 
 		const libsUtility = new Libs(this.settings);
 		libsUtility.loadLibs(this.app);
 
 		this.registerView(
 			MARP_PREVIEW_VIEW,
-			(leaf) => new MarpPreviewView(this.settings, leaf)
+			(leaf) => new MarpPreviewView(this.settings, leaf, this.workingCopies, this.exporter)
 		);
 
 		addIcon('slides-preview-marp', ICON_SLIDE_PREVIEW);
@@ -29,43 +34,50 @@ export default class MarpSlides extends Plugin {
 		addIcon('slides-marp-export-pptx', ICON_EXPORT_PPTX);
 		addIcon('slides-marp-slide-present', ICON_SLIDE_PRESENT);
 		this.addRibbonIcon('slides-preview-marp', 'Show Slide Preview', async () => {
-			await this.showPreviewSlide();
+			try {
+				await this.showPreviewSlide();
+			} catch (error) {
+				this.reportError('Marp preview failed', error);
+			}
 		});
 		
 		this.addCommand({
 			id: 'preview',
 			name: 'Slide Preview',
-			callback: () => { this.showPreviewSlide();}
+			callback: () => {
+				void this.showPreviewSlide()
+					.catch(error => this.reportError('Marp preview failed', error));
+			}
 		});
 		
 		this.addCommand({
 			id: 'export-pdf',
 			name: 'Export PDF',
-			callback: (() => this.exportFile('pdf'))
+			callback: (() => this.executeExport('pdf'))
 		});
 
 		this.addCommand({
 			id: 'export-pdf-notes',
 			name: 'Export PDF with Notes',
-			callback: (() => this.exportFile('pdf-with-notes'))
+			callback: (() => this.executeExport('pdf-with-notes'))
 		});
 
 		this.addCommand({
 			id: 'export-html',
 			name: 'Export HTML',
-			callback: (() => this.exportFile('html'))
+			callback: (() => this.executeExport('html'))
 		});
 
 		this.addCommand({
 			id: 'export-pptx',
 			name: 'Export PPTX',
-			callback: (() => this.exportFile('pptx'))
+			callback: (() => this.executeExport('pptx'))
 		});
 
 		this.addCommand({
 			id: 'export-png',
 			name: 'Export PNG',
-			callback: (() => this.exportFile('png'))
+			callback: (() => this.executeExport('png'))
 		});		
 
 		// this.addCommand({
@@ -81,10 +93,14 @@ export default class MarpSlides extends Plugin {
 			this.registerEditorSuggest(new LineSelectionListener(this.app, this));
 
 		this.registerEvent(this.app.vault.on('modify', this.onChange.bind(this)));
+		this.registerEvent(this.app.vault.on('rename', this.onRename.bind(this)));
+		this.registerEvent(this.app.vault.on('delete', this.onDelete.bind(this)));
+		this.registerEvent(this.app.workspace.on('file-open', this.onFileOpen.bind(this)));
 	}
 
 	onunload() {
 		this.app.workspace.detachLeavesOfType(MARP_PREVIEW_VIEW);
+		void this.workingCopies.dispose();
 	}
 
 	async loadSettings() {
@@ -97,15 +113,45 @@ export default class MarpSlides extends Plugin {
 
 	onChange(file: TAbstractFile) {
 		if (file == this.editorView?.file) {
-			this.slidesView.onChange(this.editorView);
+			this.refreshPreview(this.editorView);
+		}
+	}
+
+	onRename(file: TAbstractFile) {
+		if (file == this.editorView?.file) {
+			this.refreshPreview(this.editorView);
+		}
+	}
+
+	onDelete(file: TAbstractFile) {
+		const slidesView = this.getOpenSlidesView();
+		if (file instanceof TFile && slidesView?.isDisplaying(file)) {
+			this.editorView = null;
+			void slidesView.clear();
+		}
+	}
+
+	onFileOpen(file: TFile | null) {
+		const slidesView = this.getOpenSlidesView();
+		if (slidesView === null) {
+			return;
+		}
+		if (file === null) {
+			this.editorView = null;
+			void slidesView.clear();
+			return;
+		}
+		const editorView = this.app.workspace.getActiveViewOfType(MarkdownView);
+		if (editorView !== null) {
+			this.editorView = editorView;
+			this.refreshPreview(editorView);
 		}
 	}
 
 	async exportFile(type: string){
 		const file = this.app.workspace.getActiveFile();
 		if(file !== null){
-			const marpCli = new MarpExport(this.settings, this.app);
-			await marpCli.export(file,type);
+			await this.exporter.export(file,type);
 		}
 	}
 
@@ -117,7 +163,32 @@ export default class MarpSlides extends Plugin {
 		}
 
 		this.slidesView = await this.activateView();
-		this.slidesView.displaySlides(this.editorView);
+		await this.slidesView.displaySlides(this.editorView);
+	}
+
+	private executeExport(type: string): void {
+		void this.exportFile(type).catch(error => this.reportError(`Marp ${type} failed`, error));
+	}
+
+	private refreshPreview(view: MarkdownView): void {
+		const slidesView = this.getOpenSlidesView();
+		if (slidesView === null) {
+			return;
+		}
+		void slidesView.onChange(view)
+			.catch(error => this.reportError('Marp preview refresh failed', error));
+	}
+
+	private getOpenSlidesView(): MarpPreviewView | null {
+		const leaf = this.app.workspace.getLeavesOfType(MARP_PREVIEW_VIEW)
+			.find(candidate => candidate.view === this.slidesView);
+		return leaf === undefined ? null : leaf.view as MarpPreviewView;
+	}
+
+	private reportError(context: string, error: unknown): void {
+		console.error(context, error);
+		const message = error instanceof Error ? error.message : String(error);
+		new Notice(`${context}: ${message}`);
 	}
 	
 	async activateView() : Promise<MarpPreviewView> {

@@ -1,0 +1,168 @@
+jest.mock('@marp-team/marp-core', () => ({
+    Marp: jest.fn().mockImplementation(() => ({
+        render: (markdown: string) => ({ html: `<section>${markdown}</section>`, css: 'slide{}' }),
+        themeSet: { add: jest.fn() },
+        use: jest.fn().mockReturnThis(),
+    })),
+}));
+
+jest.mock('@marp-team/marp-core/browser', () => ({
+    browser: jest.fn(() => ({ update: jest.fn() })),
+}));
+
+import { App, MarkdownView, TFile, Vault, WorkspaceLeaf } from 'obsidian';
+import { MarpExport } from '../src/utilities/marpExport';
+import { DEFAULT_SETTINGS } from '../src/utilities/settings';
+import { WorkingCopy, WorkingCopyProvider } from '../src/utilities/workingCopy';
+import { MarpPreviewView } from '../src/views/marpPreviewView';
+
+function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, reject, resolve };
+}
+
+function makeContainer() {
+    const content = {
+        innerHTML: '',
+        empty() { this.innerHTML = ''; },
+        createEl(_tag: string, options: { text: string }) { this.innerHTML = options.text; },
+    };
+    return { content, root: { children: [{}, content] } };
+}
+
+function makeFile(path: string): TFile {
+    const vault = {
+        getConfig: () => 'relative',
+        adapter: {
+            getBasePath: () => '/vault',
+            getResourcePath: (resource: string) => `app://local/${resource}`,
+        },
+    } as unknown as Vault;
+    return {
+        vault,
+        path,
+        name: path.split('/').pop(),
+        basename: path.split('/').pop()?.replace(/\.md$/, ''),
+        parent: { path: path.split('/').slice(0, -1).join('/') },
+    } as unknown as TFile;
+}
+
+function makeView(file: TFile, data: string): MarkdownView {
+    return { file, data } as unknown as MarkdownView;
+}
+
+test('rapid refreshes render only the newest completed generation', async () => {
+    const file = makeFile('decks/deck.md');
+    const pending = new Map<string, ReturnType<typeof deferred<WorkingCopy>>>();
+    const content = new Map<string, string>();
+    const cleanup = jest.fn(async () => undefined);
+    const provider: WorkingCopyProvider = {
+        create: jest.fn(async (_file, source = '') => {
+            const copy = deferred<WorkingCopy>();
+            pending.set(source, copy);
+            const resolved = await copy.promise;
+            content.set(resolved.path, source);
+            return resolved;
+        }),
+        read: jest.fn(async copy => content.get(copy.path) as string),
+        cleanup,
+    };
+    const { content: container, root } = makeContainer();
+    const leaf = {
+        app: { metadataCache: {} } as App,
+        containerEl: root,
+    } as unknown as WorkspaceLeaf;
+    const exporter = { export: jest.fn() } as unknown as MarpExport;
+    const preview = new MarpPreviewView(DEFAULT_SETTINGS, leaf, provider, exporter);
+
+    const renderA = preview.displaySlides(makeView(file, 'A'));
+    const renderB = preview.displaySlides(makeView(file, 'B'));
+    const renderC = preview.displaySlides(makeView(file, 'C'));
+
+    pending.get('C')?.resolve({ directory: '/tmp/c', path: '/tmp/c/deck.md', sourcePath: file.path });
+    await renderC;
+    expect(container.innerHTML).toContain('<section>C</section>');
+
+    pending.get('A')?.resolve({ directory: '/tmp/a', path: '/tmp/a/deck.md', sourcePath: file.path });
+    pending.get('B')?.resolve({ directory: '/tmp/b', path: '/tmp/b/deck.md', sourcePath: file.path });
+    await Promise.all([renderA, renderB]);
+
+    expect(container.innerHTML).toContain('<section>C</section>');
+    expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ directory: '/tmp/a' }));
+    expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ directory: '/tmp/b' }));
+
+    await preview.onClose();
+    expect(cleanup).toHaveBeenCalledWith(expect.objectContaining({ directory: '/tmp/c' }));
+});
+
+test('note switches replace and clean the previous preview working copy', async () => {
+    const copies: WorkingCopy[] = [];
+    const cleanup = jest.fn(async () => undefined);
+    const provider: WorkingCopyProvider = {
+        create: jest.fn(async (file, source = '') => {
+            const copy = {
+                directory: `/tmp/${copies.length}`,
+                path: `/tmp/${copies.length}/${file.name}`,
+                sourcePath: file.path,
+            };
+            copies.push(copy);
+            return copy;
+        }),
+        read: jest.fn(async copy => copy.sourcePath),
+        cleanup,
+    };
+    const { content: container, root } = makeContainer();
+    const leaf = {
+        app: { metadataCache: {} } as App,
+        containerEl: root,
+    } as unknown as WorkspaceLeaf;
+    const preview = new MarpPreviewView(
+        DEFAULT_SETTINGS,
+        leaf,
+        provider,
+        { export: jest.fn() } as unknown as MarpExport,
+    );
+    const first = makeFile('one/deck.md');
+    const second = makeFile('two/deck.md');
+
+    await preview.displaySlides(makeView(first, 'first'));
+    await preview.displaySlides(makeView(second, 'second'));
+
+    expect(container.innerHTML).toContain('two/deck.md');
+    expect(preview.isDisplaying(second)).toBe(true);
+    expect(cleanup).toHaveBeenCalledWith(copies[0]);
+
+    await preview.clear();
+    expect(container.innerHTML).toBe('');
+    expect(cleanup).toHaveBeenCalledWith(copies[1]);
+});
+
+test('working-copy failures clear stale preview output and reject to the caller', async () => {
+    const provider: WorkingCopyProvider = {
+        create: jest.fn(async () => { throw new Error('temporary disk unavailable'); }),
+        read: jest.fn(),
+        cleanup: jest.fn(async () => undefined),
+    };
+    const { content: container, root } = makeContainer();
+    container.innerHTML = 'stale preview';
+    const leaf = {
+        app: { metadataCache: {} } as App,
+        containerEl: root,
+    } as unknown as WorkspaceLeaf;
+    const preview = new MarpPreviewView(
+        DEFAULT_SETTINGS,
+        leaf,
+        provider,
+        { export: jest.fn() } as unknown as MarpExport,
+    );
+
+    await expect(preview.displaySlides(makeView(makeFile('deck.md'), 'new')))
+        .rejects.toThrow('temporary disk unavailable');
+    expect(container.innerHTML).toContain('Unable to refresh Marp preview');
+    expect(container.innerHTML).not.toContain('stale preview');
+});

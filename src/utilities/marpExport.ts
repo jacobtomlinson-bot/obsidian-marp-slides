@@ -1,172 +1,151 @@
-import marpCli, { CLIError, CLIErrorCode } from '@marp-team/marp-cli'
-import { TFile, App } from 'obsidian';
+import marpCli, { CLIError, CLIErrorCode } from '@marp-team/marp-cli';
+import { TFile } from 'obsidian';
 import { MarpSlidesSettings } from './settings';
 import { FilePath } from './filePath';
-import { writeFileSync, readFileSync } from 'fs-extra';
+import { WorkingCopyProvider } from './workingCopy';
 
 export class MarpCLIError extends Error {}
 
+export type MarpCliRunner = (
+    argv: string[],
+    options?: { baseUrl?: string },
+) => Promise<number>;
+
+let marpRunQueue: Promise<void> = Promise.resolve();
+
 export class MarpExport {
+    private readonly settings: MarpSlidesSettings;
+    private readonly workingCopies: WorkingCopyProvider;
+    private readonly cli: MarpCliRunner;
 
-    private settings : MarpSlidesSettings;
-    private app : App | null;
-
-    constructor(settings: MarpSlidesSettings, app: App | null = null) {
+    constructor(
+        settings: MarpSlidesSettings,
+        workingCopies: WorkingCopyProvider,
+        cli: MarpCliRunner = marpCli,
+    ) {
         this.settings = settings;
-        this.app = app;
+        this.workingCopies = workingCopies;
+        this.cli = cli;
     }
 
-    async export(file: TFile, type: string){
+    async export(file: TFile, type: string): Promise<void> {
         const filesTool = new FilePath(this.settings);
-        await filesTool.removeFileFromRoot(file);
-        await filesTool.copyFileToRoot(file);
-        const completeFilePath = filesTool.getCompleteFilePath(file);
-        const themePath = filesTool.getThemePath(file);
-        const resourcesPath = filesTool.getLibDirectory(file.vault);
-        const marpEngineConfig = filesTool.getMarpEngine(file.vault);
-
-        // Convert wiki-link images to standard markdown before export
-        if (this.app && completeFilePath != '') {
-            try {
-                const originalContent = readFileSync(completeFilePath, 'utf-8');
-                const processedContent = filesTool.convertImageWikiLinks(originalContent, file, this.app);
-                writeFileSync(completeFilePath, processedContent, 'utf-8');
-            } catch (e) {
-                console.error('Failed to process wiki-links for export:', e);
-            }
-        }
-
-        if (completeFilePath != ''){
-            //console.log(completeFilePath);
-
-            const argv: string[] = [completeFilePath,'--allow-local-files'];
-            //const argv: string[] = ['--engine', '@marp-team/marp-core', completeFilePath,'--allow-local-files'];
-
-            if (this.settings.EnableMarkdownItPlugins){
-                argv.push('--engine');
-                argv.push(marpEngineConfig);
-            }
-
-            if (themePath != ''){
-                argv.push('--theme-set');
-                argv.push(themePath);
-            }
-
-            switch (type) {
-                case 'pdf':
-                    argv.push('--pdf');
-                    if (this.settings.EXPORT_PATH != ''){
-                        argv.push('-o');
-                        argv.push(`${this.settings.EXPORT_PATH}${file.basename}.pdf`);
-                    }
-                    break;
-                case 'pdf-with-notes':
-                    argv.push('--pdf');
-                    argv.push('--pdf-notes');
-                    argv.push('--pdf-outlines');
-                    if (this.settings.EXPORT_PATH != ''){
-                        argv.push('-o');
-                        argv.push(`${this.settings.EXPORT_PATH}${file.basename}.pdf`);
-                    }
-                    break;
-                case 'pptx':
-                    argv.push('--pptx');
-                    if (this.settings.EXPORT_PATH != ''){
-                        argv.push('-o');
-                        argv.push(`${this.settings.EXPORT_PATH}${file.basename}.pptx`);
-                    }
-                    break;
-                case 'png':
-                    argv.push('--images');
-                    argv.push('--png');
-                    if (this.settings.EXPORT_PATH != ''){
-                        argv.push('-o');
-                        argv.push(`${this.settings.EXPORT_PATH}${file.basename}.png`);
-                    }
-                    break;
-                case 'html':
-                    argv.push('--html');
-                    argv.push('--template');
-                    argv.push(this.settings.HTMLExportMode);
-                    break;
-                case 'preview':
-                    argv.push('--html');
-                    argv.push('--preview');
-                    break;
-                default:
-                    //argv.push('--template');
-                    //argv.push('bare');
-                    //argv.push('bespoke');
-                    //argv.push('--engine');
-                    //argv.push('@marp-team/marpit');
-                    //argv.remove(completeFilePath);
-                    //process.env.PORT = "5001";
-                    //argv.push('PORT=5001');
-                    //argv.push('--server');
-                    
-                    //argv.push('--watch');
-            }
-            await this.run(argv, resourcesPath);
-        } 
-
-    }
-
-    //async exportPdf(argv: string[], opts?: MarpCLIAPIOptions | undefined){
-    private async run(argv: string[], resourcesPath: string){
-        const { CHROME_PATH } = process.env;
+        const workingCopy = await this.workingCopies.create(file);
 
         try {
-            process.env.CHROME_PATH = this.settings.CHROME_PATH || CHROME_PATH;
+            const argv = this.buildArguments(file, workingCopy.path, type, filesTool);
+            const resourcesPath = filesTool.getLibDirectory(file.vault);
+            const baseUrl = filesTool.getMarpBaseUrl(file);
+            await this.run(argv, resourcesPath, baseUrl);
+        } finally {
+            await this.workingCopies.cleanup(workingCopy);
+        }
+    }
 
-            this.runMarpCli(argv, resourcesPath);
-            
-        } catch (e) {
-            console.error(e)
+    private buildArguments(
+        file: TFile,
+        workingPath: string,
+        type: string,
+        filesTool: FilePath,
+    ): string[] {
+        const argv: string[] = [workingPath, '--allow-local-files'];
+        const themePath = filesTool.getThemePath(file);
 
+        if (this.settings.EnableMarkdownItPlugins) {
+            argv.push('--engine', filesTool.getMarpEngine(file.vault));
+        }
+
+        if (themePath !== '') {
+            argv.push('--theme-set', themePath);
+        }
+
+        switch (type) {
+            case 'pdf':
+                argv.push('--pdf', '-o', filesTool.getExportPath(file, 'pdf', true));
+                break;
+            case 'pdf-with-notes':
+                argv.push(
+                    '--pdf',
+                    '--pdf-notes',
+                    '--pdf-outlines',
+                    '-o',
+                    filesTool.getExportPath(file, 'pdf', true),
+                );
+                break;
+            case 'pptx':
+                argv.push('--pptx', '-o', filesTool.getExportPath(file, 'pptx', true));
+                break;
+            case 'png':
+                argv.push('--images', '--png', '-o', filesTool.getExportPath(file, 'png', true));
+                break;
+            case 'html':
+                argv.push(
+                    '--html',
+                    '--template',
+                    this.settings.HTMLExportMode,
+                    '-o',
+                    filesTool.getExportPath(file, 'html', false),
+                );
+                break;
+            case 'preview':
+                argv.push('--html', '--preview');
+                break;
+            default:
+                throw new MarpCLIError(`Unsupported Marp export type: ${type}`);
+        }
+
+        return argv;
+    }
+
+    private async run(argv: string[], resourcesPath: string, baseUrl: string): Promise<void> {
+        try {
+            const queuedRun = marpRunQueue.then(async () => {
+                const { CHROME_PATH } = process.env;
+                try {
+                    process.env.CHROME_PATH = this.settings.CHROME_PATH || CHROME_PATH;
+                    await this.runMarpCli(argv, resourcesPath, baseUrl);
+                } finally {
+                    process.env.CHROME_PATH = CHROME_PATH;
+                }
+            });
+            marpRunQueue = queuedRun.catch(() => undefined);
+            await queuedRun;
+        } catch (error) {
             if (
-                e instanceof CLIError &&
-                e.errorCode === CLIErrorCode.NOT_FOUND_CHROMIUM
+                error instanceof CLIError &&
+                error.errorCode === CLIErrorCode.NOT_FOUND_CHROMIUM
             ) {
-                const browsers = ['[Google Chrome](https://www.google.com/chrome/)']
+                const browsers = ['[Google Chrome](https://www.google.com/chrome/)'];
 
-                if (process.platform === 'linux')
-                    browsers.push('[Chromium](https://www.chromium.org/)')
+                if (process.platform === 'linux') {
+                    browsers.push('[Chromium](https://www.chromium.org/)');
+                }
 
-                browsers.push('[Microsoft Edge](https://www.microsoft.com/edge)')
+                browsers.push('[Microsoft Edge](https://www.microsoft.com/edge)');
 
                 throw new MarpCLIError(
                     `It requires to install ${browsers
-                    .join(', ')
-                    .replace(/, ([^,]*)$/, ' or $1')} for exporting.`
-                )
+                        .join(', ')
+                        .replace(/, ([^,]*)$/, ' or $1')} for exporting.`,
+                );
             }
 
-            throw e
-        } finally {
-            process.env.CHROME_PATH = CHROME_PATH
+            throw error;
         }
     }
 
-    private async runMarpCli(argv: string[], resourcesPath: string) {
-        //console.info(`Execute Marp CLI [${argv.join(' ')}] (${JSON.stringify(opts)})`)
+    private async runMarpCli(argv: string[], resourcesPath: string, baseUrl: string): Promise<void> {
         console.info(`Execute Marp CLI [${argv.join(' ')}]`);
-        let temp__dirname = __dirname;
+        const originalDirname = __dirname;
 
-        try {    
+        try {
             __dirname = resourcesPath;
-            const exitCode = await marpCli(argv, {});
-
-            if (exitCode > 0) {
-                console.error(`Failure (Exit status: ${exitCode})`)
+            const exitCode = await this.cli(argv, { baseUrl });
+            if (exitCode !== 0) {
+                throw new MarpCLIError(`Marp export failed with exit status ${exitCode}.`);
             }
-        } catch(e) {
-            if (e instanceof CLIError){
-                console.error(`CLIError code: ${e.errorCode}, message: ${e.message}`);
-            } else {
-                console.error("Generic Error!");
-            }
+        } finally {
+            __dirname = originalDirname;
         }
-
-        __dirname = temp__dirname;
     }
 }

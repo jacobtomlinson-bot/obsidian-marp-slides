@@ -1,174 +1,127 @@
-import { Vault, normalizePath, FileSystemAdapter, TFile, App } from 'obsidian';
+import { dirname, join, posix, resolve } from 'path';
+import { pathToFileURL } from 'url';
+import { App, FileSystemAdapter, normalizePath, TFile, Vault } from 'obsidian';
 import { MarpSlidesSettings } from './settings';
 
-export class FilePath  {
+const IMAGE_EXTENSION = /\.(png|jpg|jpeg|gif|svg|webp|bmp)$/i;
+const IMAGE_WIKI_LINK = /!\[\[([^\]|]+?)(?:\|([^\]]*))?\]\]/g;
 
-    private settings : MarpSlidesSettings;
+function encodePathSegment(segment: string): string {
+    if (segment === '.' || segment === '..') {
+        return segment;
+    }
+    return encodeURIComponent(segment).replace(/[!'()*]/g, character =>
+        `%${character.charCodeAt(0).toString(16).toUpperCase()}`,
+    );
+}
+
+function encodeMarkdownPath(path: string): string {
+    return path.split('/').map(encodePathSegment).join('/');
+}
+
+function escapeAltText(text: string): string {
+    return text.replace(/\\/g, '\\\\').replace(/\]/g, '\\]');
+}
+
+export function directoryToFileUrl(
+    directory: string,
+    windows = process.platform === 'win32',
+): string {
+    const pathWithSeparator = /[/\\]$/.test(directory)
+        ? directory
+        : `${directory}${windows ? '\\' : '/'}`;
+    const platformAwarePathToFileURL = pathToFileURL as unknown as (
+        path: string,
+        options?: { windows?: boolean },
+    ) => URL;
+    return platformAwarePathToFileURL(pathWithSeparator, { windows }).href;
+}
+
+export class FilePath {
+    private readonly settings: MarpSlidesSettings;
 
     constructor(settings: MarpSlidesSettings) {
         this.settings = settings;
     }
 
-    private getLinkFormat(file: TFile): string {
-        //console.log(`newLinkFormat: ${(file.vault as any).getConfig("newLinkFormat")}`);
-        return (file.vault as any).getConfig("newLinkFormat");
+    public isAbsoluteLinkFormat(file: TFile): boolean {
+        return (file.vault as Vault & { getConfig(key: string): string })
+            .getConfig('newLinkFormat') === 'absolute';
     }
 
-    private isAbsoluteLinkFormat(file: TFile): boolean {
-        if(this.getLinkFormat(file) == "absolute"){
-            return true;
-        }
-        else{
-            return false;
-        }
+    public getVaultPath(vault: Vault): string {
+        return resolve((vault.adapter as FileSystemAdapter).getBasePath());
     }
 
-    private getRootPath(file: TFile): string {
-        
-		let basePath = (file.vault.adapter as FileSystemAdapter).getBasePath();
-        if (basePath.startsWith('/')){
-            basePath = `/${normalizePath(basePath)}/`;
-        }
-        else
-        {
-            basePath = `${normalizePath(basePath)}/`;
-        }
-
-        //console.log(`Root Path: ${basePath}`);
-        return basePath;
-	}
-
-	public getCompleteFileBasePath(file: TFile): string{
-        let resourcePath = [""];
-        if(this.isAbsoluteLinkFormat(file)){
-            resourcePath = (file.vault.adapter as FileSystemAdapter).getResourcePath(normalizePath("/")).split("?");
-        }
-        else
-        {
-            if (file.parent != null){
-                resourcePath = (file.vault.adapter as FileSystemAdapter).getResourcePath(normalizePath(file.parent.path)).split("?");
-            }
-        }
-        //console.log(`Complete File Base Path: ${resourcePath}`);
-        return `${resourcePath[0]}/`;
-	}
-
-    public getCompleteFilePath(file: TFile) : string{
-
-        let basePath = `${this.getRootPath(file)}${normalizePath(file.path)}`;
-        if(this.isAbsoluteLinkFormat(file)){
-            basePath = `${this.getRootPath(file)}${normalizePath(file.name)}`;
-        }
-        //console.log(`Complete File Path: ${basePath}`);
-        return basePath;
-	}
-
-    public async copyFileToRoot(file: TFile) {
-        if(this.isAbsoluteLinkFormat(file)){
-            await (file.vault.adapter as FileSystemAdapter).copy(file.path, file.name);
-            //console.log(`copied!`);
-        }
+    public getSourceFilePath(file: TFile): string {
+        return resolve(this.getVaultPath(file.vault), ...normalizePath(file.path).split('/'));
     }
 
-    public async removeFileFromRoot(file: TFile) {
-        const isFileExists = await (file.vault.adapter as FileSystemAdapter).exists(file.name);
-        if(this.isAbsoluteLinkFormat(file) && isFileExists){
-            await (file.vault.adapter as FileSystemAdapter).remove(file.name);
-        }
+    public getCompleteFilePath(file: TFile): string {
+        return this.getSourceFilePath(file);
     }
 
-    public getThemePath(file: TFile): string{
-        const themePath = `${this.getRootPath(file)}${normalizePath(this.settings.ThemePath)}`;
-        //console.log(`Theme Path: ${themePath}`);
-        if (this.settings.ThemePath != ''){
-            return themePath;
-        } 
-        else
-        {
-            return '';
-        }
+    public getCompleteFileBasePath(file: TFile): string {
+        const vaultPath = this.isAbsoluteLinkFormat(file)
+            ? normalizePath('/')
+            : normalizePath(file.parent?.path || '/');
+        const resourcePath = (file.vault.adapter as FileSystemAdapter)
+            .getResourcePath(vaultPath)
+            .split('?')[0];
+        return resourcePath.endsWith('/') ? resourcePath : `${resourcePath}/`;
+    }
+
+    /** Base URL passed to Marp CLI so resources still resolve from the source note. */
+    public getMarpBaseUrl(file: TFile): string {
+        const baseDirectory = this.isAbsoluteLinkFormat(file)
+            ? this.getVaultPath(file.vault)
+            : dirname(this.getSourceFilePath(file));
+        return directoryToFileUrl(baseDirectory);
+    }
+
+    public getExportPath(file: TFile, extension: string, useConfiguredPath: boolean): string {
+        const directory = useConfiguredPath && this.settings.EXPORT_PATH !== ''
+            ? resolve(this.settings.EXPORT_PATH)
+            : dirname(this.getSourceFilePath(file));
+        return join(directory, `${file.basename}.${extension}`);
+    }
+
+    public getThemePath(file: TFile): string {
+        return this.settings.ThemePath === ''
+            ? ''
+            : resolve(this.getVaultPath(file.vault), ...normalizePath(this.settings.ThemePath).split('/'));
     }
 
     private getPluginDirectory(vault: Vault): string {
-        const fileSystem = vault.adapter as FileSystemAdapter;
-        const path = `${fileSystem.getBasePath()}/${normalizePath(vault.configDir)}/plugins/marp-slides/`;
-        //console.log(path);
-        return path;
-	}
+        return join(this.getVaultPath(vault), normalizePath(vault.configDir), 'plugins', 'marp-slides');
+    }
 
     public getLibDirectory(vault: Vault): string {
-        const pluginDirectory = this.getPluginDirectory(vault);
-        const path = `${pluginDirectory}lib3/`;
-        //console.log(path);
-        return path;
-	}
+        return join(this.getPluginDirectory(vault), 'lib3');
+    }
 
     public getMarpEngine(vault: Vault): string {
-        const libDirectory = this.getLibDirectory(vault);
-        const path = `${libDirectory}marp.config.js`;
-        //console.log(path);
-        return path;
-	}
+        return join(this.getLibDirectory(vault), 'marp.config.js');
+    }
 
-    /**
-     * Convert Obsidian wiki-link image syntax to standard Markdown.
-     * Transforms ![[image.png]] to ![image.png](path/to/image.png)
-     */
+    /** Convert only resolvable Obsidian image embeds in the supplied snapshot. */
     public convertImageWikiLinks(markdown: string, sourceFile: TFile, app: App): string {
-        // Image extensions to convert
-        const imageExtensions = /\.(png|jpg|jpeg|gif|svg|webp|bmp)$/i;
-
-        // Regex: ![[filename]] or ![[filename|alt text]]
-        const wikiLinkRegex = /!\[\[([^\]|]+?)(?:\|([^\]]*))?\]\]/g;
-
-        return markdown.replace(wikiLinkRegex, (match, filename, altText) => {
-            // Only process image files
-            if (!imageExtensions.test(filename)) {
+        return markdown.replace(IMAGE_WIKI_LINK, (match, rawLink: string, alias?: string) => {
+            const linkpath = rawLink.trim();
+            if (!IMAGE_EXTENSION.test(linkpath)) {
                 return match;
             }
 
-            // Use Obsidian's link resolver to find the file
-            const linkedFile = app.metadataCache.getFirstLinkpathDest(filename, sourceFile.path);
-
-            if (linkedFile) {
-                // Build path based on link format setting
-                let imagePath: string;
-                if (this.isAbsoluteLinkFormat(sourceFile)) {
-                    // Absolute: path from vault root
-                    imagePath = linkedFile.path;
-                } else {
-                    // Relative: path from source file's folder
-                    imagePath = this.getRelativePathFromFile(sourceFile, linkedFile);
-                }
-
-                const alt = altText || filename;
-                return `![${alt}](${imagePath})`;
+            const linkedFile = app.metadataCache.getFirstLinkpathDest(linkpath, sourceFile.path);
+            if (linkedFile === null) {
+                return match;
             }
 
-            // File not found - return original
-            return match;
+            const targetPath = this.isAbsoluteLinkFormat(sourceFile)
+                ? linkedFile.path
+                : posix.relative(sourceFile.parent?.path || '', linkedFile.path);
+            const alt = alias === undefined || alias === '' ? linkedFile.name : alias;
+            return `![${escapeAltText(alt)}](${encodeMarkdownPath(targetPath)})`;
         });
-    }
-
-    /**
-     * Calculate relative path from source file to target file.
-     */
-    private getRelativePathFromFile(sourceFile: TFile, targetFile: TFile): string {
-        const sourceParts = sourceFile.parent?.path.split('/').filter(p => p) || [];
-        const targetParts = targetFile.path.split('/').filter(p => p);
-
-        // Find common prefix length
-        let commonLength = 0;
-        while (commonLength < sourceParts.length &&
-               commonLength < targetParts.length - 1 &&
-               sourceParts[commonLength] === targetParts[commonLength]) {
-            commonLength++;
-        }
-
-        // Build relative path
-        const upCount = sourceParts.length - commonLength;
-        const relativeParts = [...Array(upCount).fill('..'), ...targetParts.slice(commonLength)];
-
-        return relativeParts.join('/');
     }
 }

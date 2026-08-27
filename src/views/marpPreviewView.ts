@@ -1,10 +1,11 @@
-import { ItemView, WorkspaceLeaf, MarkdownView, normalizePath, TFile } from 'obsidian';
+import { ItemView, WorkspaceLeaf, MarkdownView, normalizePath, Notice, TFile } from 'obsidian';
 import { Marp } from '@marp-team/marp-core'
 import { browser, type MarpCoreBrowser } from '@marp-team/marp-core/browser'
 
 import { MarpSlidesSettings } from '../utilities/settings'
 import { MarpExport } from '../utilities/marpExport';
 import { FilePath } from '../utilities/filePath'
+import { WorkingCopy, WorkingCopyProvider } from '../utilities/workingCopy';
 import { MathOptions } from '@marp-team/marp-core/types/src/math/math';
 
 const markdownItContainer = require('markdown-it-container');
@@ -19,12 +20,24 @@ export class MarpPreviewView extends ItemView  {
     private marpBrowser: MarpCoreBrowser | undefined;
     private settings : MarpSlidesSettings;
 
-    private file : TFile;
+    private file : TFile | undefined;
+    private requestedFile: TFile | undefined;
+    private workingCopy: WorkingCopy | undefined;
+    private renderGeneration = 0;
+    private readonly workingCopies: WorkingCopyProvider;
+    private readonly exporter: MarpExport;
 
-    constructor(settings: MarpSlidesSettings, leaf: WorkspaceLeaf) {
+    constructor(
+        settings: MarpSlidesSettings,
+        leaf: WorkspaceLeaf,
+        workingCopies: WorkingCopyProvider,
+        exporter: MarpExport,
+    ) {
         super(leaf);
 
         this.settings = settings;
+        this.workingCopies = workingCopies;
+        this.exporter = exporter;
 
         this.marp = new Marp({
             container: { tag: 'div', id: '__marp-vscode' },
@@ -78,12 +91,18 @@ export class MarpPreviewView extends ItemView  {
     }
 
     async onClose() {
-        // Nothing to clean up.
-        // console.log("marp slide onclose");
+        this.renderGeneration++;
+        const workingCopy = this.workingCopy;
+        this.workingCopy = undefined;
+        this.file = undefined;
+        this.requestedFile = undefined;
+        if (workingCopy !== undefined) {
+            await this.workingCopies.cleanup(workingCopy);
+        }
     }
 
     async onChange(view : MarkdownView) {
-        this.displaySlides(view);
+        await this.displaySlides(view);
     }
 
     async onLineChanged(line: number) {
@@ -95,57 +114,69 @@ export class MarpPreviewView extends ItemView  {
 	}
 
     async addActions() {
-        const marpCli = new MarpExport(this.settings, this.app);
-        
         this.addAction('image', 'Export as PNG', () => {
-            if (this.file) {
-                marpCli.export(this.file, 'png');
-            }
+            this.runExport('png');
         });
 
         this.addAction('code-glyph', 'Export as HTML', () => {
-            if (this.file) {
-                marpCli.export(this.file, 'html');
-            }
+            this.runExport('html');
         });
 
         this.addAction('slides-marp-export-pdf', 'Export as PDF', () => {
-            if (this.file) {
-                marpCli.export(this.file, 'pdf');
-            }
+            this.runExport('pdf');
         });
 
         this.addAction('slides-marp-export-pptx', 'Export as PPTX', () => {
-            if (this.file) {
-                marpCli.export(this.file, 'pptx');
-            }
+            this.runExport('pptx');
         });
 
         this.addAction('slides-marp-slide-present', 'Preview Slides', () => {
-            if (this.file) {
-                marpCli.export(this.file, 'preview');
-            }
+            this.runExport('preview');
         });
       }
+
+    async clear(): Promise<void> {
+        this.renderGeneration++;
+        const workingCopy = this.workingCopy;
+        this.workingCopy = undefined;
+        this.file = undefined;
+        this.requestedFile = undefined;
+        this.containerEl.children[1].empty();
+        if (workingCopy !== undefined) {
+            await this.workingCopies.cleanup(workingCopy);
+        }
+    }
+
+    isDisplaying(file: TFile): boolean {
+        return this.file === file || this.file?.path === file.path ||
+            this.requestedFile === file || this.requestedFile?.path === file.path;
+    }
     
     async displaySlides(view : MarkdownView) {
 
-        if (view.file != null) {
-            this.file = view.file;
+        if (view.file === null) {
+            await this.clear();
+            return;
+        }
+
+        const generation = ++this.renderGeneration;
+        this.requestedFile = view.file;
+        let nextCopy: WorkingCopy | undefined;
+
+        try {
+            nextCopy = await this.workingCopies.create(view.file, view.data);
+            const processedMarkdown = await this.workingCopies.read(nextCopy);
+
+            if (generation !== this.renderGeneration) {
+                await this.workingCopies.cleanup(nextCopy);
+                return;
+            }
+
             const filePath = new FilePath(this.settings);
             const basePath = filePath.getCompleteFileBasePath(view.file);
-            const markdownText = view.data;
-
-            // Convert wiki-link images to standard markdown
-            const processedMarkdown = filePath.convertImageWikiLinks(markdownText, view.file, this.app);
-
-            const container = this.containerEl.children[1];
-            container.empty();
-
-
             let { html, css } = this.marp.render(processedMarkdown);
-            
-            // Replace Backgorund Url for images
+
+            // Replace Background Url for images
             html = html.replace(/(?!background-image:url\(&quot;http)background-image:url\(&quot;/g, `background-image:url(&quot;${basePath}`);
 
             const htmlFile = `
@@ -159,12 +190,43 @@ export class MarpPreviewView extends ItemView  {
                 </html>
                 `;
 
+            const container = this.containerEl.children[1];
+            container.empty();
             container.innerHTML = htmlFile;
             this.marpBrowser?.update();
-        }
-        else
-        {
-            console.log("Errore: view.file is null")
+
+            const previousCopy = this.workingCopy;
+            this.workingCopy = nextCopy;
+            nextCopy = undefined;
+            this.file = view.file;
+
+            if (previousCopy !== undefined) {
+                await this.workingCopies.cleanup(previousCopy);
+            }
+        } catch (error) {
+            if (nextCopy !== undefined) {
+                await this.workingCopies.cleanup(nextCopy);
+            }
+            if (generation === this.renderGeneration) {
+                const container = this.containerEl.children[1];
+                container.empty();
+                container.createEl('p', { text: `Unable to refresh Marp preview: ${this.errorMessage(error)}` });
+            }
+            throw error;
         }
 	}
+
+    private runExport(type: string): void {
+        if (this.file === undefined) {
+            return;
+        }
+        void this.exporter.export(this.file, type).catch(error => {
+            console.error(`Unable to run Marp ${type}.`, error);
+            new Notice(`Unable to run Marp ${type}: ${this.errorMessage(error)}`);
+        });
+    }
+
+    private errorMessage(error: unknown): string {
+        return error instanceof Error ? error.message : String(error);
+    }
 }

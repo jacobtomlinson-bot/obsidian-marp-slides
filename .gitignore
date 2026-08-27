@@ -4,6 +4,7 @@
 # Intellij
 *.iml
 .idea
+.worktrees/
 
 
 # npm
