@@ -241,6 +241,7 @@ test('rejects anchored remote-theme YAML without rewriting or downloading', asyn
 test.each([
     '@IMPORT "file:///tmp/local.css";',
     'section { background: u\\72l(file:///etc/passwd) }',
+    'section{background-image:image-set("file:///tmp/local-secret.png" 1x)}',
 ])('rejects decoded unsafe remote CSS before real Core or CLI can receive it: %s', async css => {
     // Both bundled renderers preserve these references, so acquisition must reject them.
     const rawTheme = `/* @theme unsafe-real */\n${css}`;
@@ -268,6 +269,7 @@ test.each([
     await fs.mkdir(join(fixture.absoluteSource, '..'), { recursive: true });
     const originalBytes = Buffer.from(content, 'utf8');
     await fs.writeFile(fixture.absoluteSource, originalBytes);
+    const writeSpy = jest.spyOn(fs, 'writeFile');
     const manager = new WorkingCopyManager(fixture.app, DEFAULT_SETTINGS, {
         temporaryDirectory: testRoot,
         fetcher: async url => ({
@@ -279,6 +281,8 @@ test.each([
     });
 
     await expect(manager.create(fixture.file)).rejects.toThrow('is not allowed');
+    expect(writeSpy.mock.calls.every(call => call[0] !== fixture.absoluteSource)).toBe(true);
     expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
     await manager.dispose();
+    writeSpy.mockRestore();
 });

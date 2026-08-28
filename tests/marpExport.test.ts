@@ -265,6 +265,7 @@ test('every export mode uses the same cached local file for a URL-backed theme',
 test.each([
     '@IMPORT "file:///tmp/local.css";',
     'section { background: u\\72l(file:///etc/passwd) }',
+    'section{background-image:image-set("file:///tmp/local-secret.png" 1x)}',
 ])('never invokes the CLI for decoded unsafe remote CSS: %s', async css => {
     const source = '---\ntheme: https://cdn.example.com/unsafe.css\n---\n# Unsafe';
     const fixture = await makeFixture('relative', source, {

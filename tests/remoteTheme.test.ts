@@ -355,12 +355,20 @@ test.each([
 
 test('rebases protocol-relative CSS resources and rejects local or executable schemes', () => {
     const prepared = prepareRemoteThemeCss(
-        '@import url("//cdn.example.com/base.css"); section { background: url(//cdn.example.com/a.png) }',
+        [
+            '@import url("//cdn.example.com/base.css");',
+            'section {',
+            '  background: url(//cdn.example.com/a.png);',
+            '  background-image: image-set("../images/one.png" 1x, "//cdn.example.com/two.png" 2x);',
+            '}',
+        ].join('\n'),
         'https://themes.example.com/path/theme.css',
         'remote-safe',
     );
     expect(prepared).toContain('https://cdn.example.com/base.css');
     expect(prepared).toContain('https://cdn.example.com/a.png');
+    expect(prepared).toContain('https://themes.example.com/images/one.png');
+    expect(prepared).toContain('https://cdn.example.com/two.png');
 
     for (const unsafe of [
         'section { background: url(file:///etc/passwd) }',
@@ -368,6 +376,9 @@ test('rebases protocol-relative CSS resources and rejects local or executable sc
         '@import "javascript:alert(1)";',
         '@IMPORT "file:///tmp/local.css";',
         'section { background: u\\72l(file:///etc/passwd) }',
+        'section { background-image: image-set("file:///tmp/local-secret.png" 1x) }',
+        'section { background-image: i\\6d age-set("file:///tmp/local-secret.png" 1x) }',
+        'section { background-image: -WEBKIT-IMAGE-SET("blob:https://example.com/id" 1x) }',
     ]) {
         expect(() => prepareRemoteThemeCss(
             unsafe,

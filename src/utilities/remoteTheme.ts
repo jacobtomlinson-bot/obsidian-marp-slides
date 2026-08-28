@@ -373,6 +373,71 @@ function decodeCssEscapes(value: string): string {
     );
 }
 
+function normalizeCssFunctionIdentifiers(value: string): string {
+    let normalized = '';
+    let index = 0;
+    while (index < value.length) {
+        const character = value[index];
+        if (character === '"' || character === "'") {
+            const start = index++;
+            while (index < value.length) {
+                if (value[index] === '\\') {
+                    index += Math.min(2, value.length - index);
+                } else if (value[index++] === character) {
+                    break;
+                }
+            }
+            normalized += value.slice(start, index);
+            continue;
+        }
+        if (character === '/' && value[index + 1] === '*') {
+            const end = value.indexOf('*/', index + 2);
+            const next = end < 0 ? value.length : end + 2;
+            normalized += value.slice(index, next);
+            index = next;
+            continue;
+        }
+        if (!/[\w-]/.test(character) && character.charCodeAt(0) < 0x80 && character !== '\\') {
+            normalized += character;
+            index++;
+            continue;
+        }
+
+        const start = index;
+        let escaped = false;
+        while (index < value.length) {
+            if (/[\w-]/.test(value[index]) || value.charCodeAt(index) >= 0x80) {
+                index++;
+                continue;
+            }
+            if (value[index] !== '\\' || index + 1 >= value.length) {
+                break;
+            }
+            escaped = true;
+            index++;
+            let hexadecimal = 0;
+            while (index < value.length && hexadecimal < 6 && /[\da-f]/i.test(value[index])) {
+                hexadecimal++;
+                index++;
+            }
+            if (hexadecimal > 0) {
+                if (value[index] === '\r' && value[index + 1] === '\n') {
+                    index += 2;
+                } else if (/[\t\n\f\r ]/.test(value[index] || '')) {
+                    index++;
+                }
+            } else {
+                index++;
+            }
+        }
+        const identifier = value.slice(start, index);
+        normalized += escaped && value[index] === '('
+            ? decodeCssEscapes(identifier)
+            : identifier;
+    }
+    return normalized;
+}
+
 function cssResourceReference(node: CssFunctionNode): string {
     if (node.unclosed) {
         throw new RemoteThemeError('Remote theme contains an invalid CSS resource URL.');
@@ -384,14 +449,43 @@ function cssResourceReference(node: CssFunctionNode): string {
     return decodeCssEscapes(serialized);
 }
 
+function rebaseImageSetStrings(node: CssFunctionNode, baseUrl: string): void {
+    let startsAlternative = true;
+    for (const child of node.nodes) {
+        if (child.type === 'space' || child.type === 'comment') {
+            continue;
+        }
+        if (child.type === 'div' && child.value === ',') {
+            startsAlternative = true;
+            continue;
+        }
+        if (!startsAlternative) {
+            continue;
+        }
+        startsAlternative = false;
+        if (child.type === 'string') {
+            const reference = decodeCssEscapes(child.value);
+            child.value = rebaseReference(reference, baseUrl);
+        }
+    }
+}
+
 function rebaseUrlFunctions(
     value: string,
     baseUrl: string,
     shouldRebase: (reference: string) => boolean = () => true,
 ): string {
-    const parsed = valueParser(value);
+    const parsed = valueParser(normalizeCssFunctionIdentifiers(value));
     parsed.walk(node => {
-        if (node.type !== 'function' || decodeCssEscapes(node.value).toLowerCase() !== 'url') {
+        if (node.type !== 'function') {
+            return;
+        }
+        const identifier = decodeCssEscapes(node.value).toLowerCase();
+        if (identifier === 'image-set' || identifier === '-webkit-image-set') {
+            rebaseImageSetStrings(node, baseUrl);
+            return;
+        }
+        if (identifier !== 'url') {
             return;
         }
         const reference = cssResourceReference(node);
