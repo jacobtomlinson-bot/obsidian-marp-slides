@@ -5,8 +5,10 @@ import {
     fetchRemoteThemeWith,
     findRemoteThemeDirective,
     normalizeRemoteThemeUrl,
+    prepareRemoteThemeCss,
     RemoteThemeCache,
     RemoteThemeFetcher,
+    RemoteThemeFileSystem,
     RemoteThemeHttpResponse,
     RemoteThemeRequester,
     REMOTE_THEME_MAX_BYTES,
@@ -15,6 +17,16 @@ import {
 } from '../src/utilities/remoteTheme';
 
 let testRoot: string;
+
+function deferred<T>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (error: unknown) => void;
+    const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+        resolve = resolvePromise;
+        reject = rejectPromise;
+    });
+    return { promise, reject, resolve };
+}
 
 beforeEach(async () => {
     testRoot = await fs.mkdtemp(join(tmpdir(), 'marp-remote-theme-test-'));
@@ -30,7 +42,26 @@ function response(
     status = 200,
     finalUrl = 'https://cdn.example.com/themes/deck.css',
 ): RemoteThemeHttpResponse {
-    return { status, headers, body: Buffer.from(css), finalUrl };
+    return {
+        status,
+        headers,
+        body: Buffer.from(css),
+        finalUrl,
+        validatorsSent: status === 304,
+    };
+}
+
+function remoteFileSystem(
+    overrides: Partial<RemoteThemeFileSystem> = {},
+): RemoteThemeFileSystem {
+    return {
+        mkdir: (path, options) => fs.mkdir(path, options),
+        rename: (oldPath, newPath) => fs.rename(oldPath, newPath),
+        rm: (path, options) => fs.rm(path, options),
+        stat: path => fs.stat(path),
+        writeFile: (path, data, encoding) => fs.writeFile(path, data, encoding),
+        ...overrides,
+    };
 }
 
 test('classifies only safe HTTP(S) theme URLs and ignores local theme values', () => {
@@ -63,6 +94,24 @@ test('rewrites a URL theme only in the working snapshot and preserves YAML comme
         'theme: cached-theme # remote',
     );
     expect(findRemoteThemeDirective('---\ntheme: gaia\n---\n# Deck')).toBeUndefined();
+
+    const nested = [
+        '---',
+        'meta:',
+        '  theme: local',
+        'theme: https://cdn.example.com/top.css',
+        '---',
+    ].join('\n');
+    const nestedDirective = findRemoteThemeDirective(nested);
+    expect(nestedDirective?.replace(nested, 'cached-top')).toContain(
+        'meta:\n  theme: local\ntheme: cached-top',
+    );
+    expect(() => findRemoteThemeDirective([
+        '---',
+        'theme: >',
+        '  https://cdn.example.com/folded.css',
+        '---',
+    ].join('\n'))).toThrow('single-line, top-level YAML theme scalar');
 });
 
 test('caches fresh CSS, conditionally revalidates, and publishes immutable updated versions', async () => {
@@ -274,6 +323,28 @@ test.each([
     await expect(fs.stat(join(testRoot, 'themes'))).rejects.toMatchObject({ code: 'ENOENT' });
 });
 
+test('rebases protocol-relative CSS resources and rejects local or executable schemes', () => {
+    const prepared = prepareRemoteThemeCss(
+        '@import url("//cdn.example.com/base.css"); section { background: url(//cdn.example.com/a.png) }',
+        'https://themes.example.com/path/theme.css',
+        'remote-safe',
+    );
+    expect(prepared).toContain('https://cdn.example.com/base.css');
+    expect(prepared).toContain('https://cdn.example.com/a.png');
+
+    for (const unsafe of [
+        'section { background: url(file:///etc/passwd) }',
+        'section { background: url(blob:https://example.com/id) }',
+        '@import "javascript:alert(1)";',
+    ]) {
+        expect(() => prepareRemoteThemeCss(
+            unsafe,
+            'https://themes.example.com/theme.css',
+            'remote-unsafe',
+        )).toThrow('is not allowed');
+    }
+});
+
 test('strips a UTF-8 BOM and fails closed on refresh errors', async () => {
     let now = 0;
     const fetcher = jest.fn()
@@ -300,6 +371,64 @@ test('cleans partial files and surfaces an atomic publication failure', async ()
     expect(files).toEqual([]);
     rename.mockRestore();
 });
+
+test.each(['mkdir', 'writeFile', 'rename'] as const)(
+    'dispose waits for an in-progress %s publication and prevents root recreation',
+    async operation => {
+        const started = deferred<void>();
+        const proceed = deferred<void>();
+        const base = remoteFileSystem();
+        let fileSystem: RemoteThemeFileSystem;
+        switch (operation) {
+            case 'mkdir':
+                fileSystem = remoteFileSystem({
+                    mkdir: async (path, options) => {
+                        started.resolve(undefined);
+                        await proceed.promise;
+                        return base.mkdir(path, options);
+                    },
+                });
+                break;
+            case 'writeFile':
+                fileSystem = remoteFileSystem({
+                    writeFile: async (path, data, encoding) => {
+                        started.resolve(undefined);
+                        await proceed.promise;
+                        return base.writeFile(path, data, encoding);
+                    },
+                });
+                break;
+            case 'rename':
+                fileSystem = remoteFileSystem({
+                    rename: async (oldPath, newPath) => {
+                        started.resolve(undefined);
+                        await proceed.promise;
+                        return base.rename(oldPath, newPath);
+                    },
+                });
+                break;
+        }
+        const cache = new RemoteThemeCache(async () => testRoot, {
+            fetcher: async () => response('section {}'),
+            fileSystem,
+        });
+
+        const acquisition = cache.acquire(`https://dispose.example/${operation}.css`);
+        const rejectedAcquisition = expect(acquisition).rejects.toThrow('cancelled');
+        await started.promise;
+        let disposeSettled = false;
+        const disposal = cache.dispose().then(() => { disposeSettled = true; });
+        await Promise.resolve();
+        expect(disposeSettled).toBe(false);
+
+        proceed.resolve(undefined);
+        await disposal;
+        await rejectedAcquisition;
+        await fs.rm(testRoot, { recursive: true, force: true });
+        await Promise.resolve();
+        await expect(fs.stat(testRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+);
 
 test('HTTP client follows bounded relative redirects and strips validators across origins', async () => {
     const requests: Array<{ headers: Readonly<Record<string, string>>; url: string }> = [];
@@ -329,6 +458,38 @@ test('HTTP client follows bounded relative redirects and strips validators acros
     expect(result.finalUrl).toBe('https://other.example/theme.css');
     expect(requests[0].headers).toEqual({ 'If-None-Match': '"private-to-origin"' });
     expect(requests[1].headers).toEqual({});
+    expect(result.validatorsSent).toBe(false);
+});
+
+test('rejects a cross-origin final 304 after conditional validators were stripped', async () => {
+    let now = 0;
+    const requester: RemoteThemeRequester = async url => url.host === 'origin.example'
+        ? {
+            status: 302,
+            headers: { location: 'https://other.example/theme.css' } as Record<string, string>,
+            body: Buffer.alloc(0),
+        }
+        : { status: 304, headers: {} as Record<string, string>, body: Buffer.alloc(0) };
+    const redirected304: RemoteThemeFetcher = (url, headers, signal) =>
+        fetchRemoteThemeWith(requester, url, headers, signal);
+    const fetcher = jest.fn()
+        .mockResolvedValueOnce(response('section { color: red }', {
+            'content-type': 'text/css',
+            etag: '"v1"',
+        }, 200, 'https://other.example/theme.css'))
+        .mockImplementationOnce(redirected304);
+    const cache = new RemoteThemeCache(async () => testRoot, {
+        fetcher,
+        maxTtlMs: 1,
+        now: () => now,
+    });
+    const url = 'https://origin.example/theme.css';
+
+    await cache.release(await cache.acquire(url));
+    now = 2;
+    await expect(cache.acquire(url)).rejects.toThrow(
+        '304 without a validator on the final request',
+    );
 });
 
 test('rejects redirect loops and HTTPS downgrade targets', async () => {

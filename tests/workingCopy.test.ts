@@ -3,6 +3,7 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { App, TFile, Vault } from 'obsidian';
 import { Marp } from '@marp-team/marp-core';
+import marpCli from '@marp-team/marp-cli';
 import { DEFAULT_SETTINGS } from '../src/utilities/settings';
 import { WorkingCopyManager } from '../src/utilities/workingCopy';
 import { RemoteThemeFetcher } from '../src/utilities/remoteTheme';
@@ -144,7 +145,12 @@ test('downloads a URL theme off-vault and rewrites only the temporary snapshot',
     const fetcher: RemoteThemeFetcher = jest.fn(async url => ({
         status: 200,
         headers: { 'content-type': 'text/css', etag: '"remote-v1"' },
-        body: Buffer.from('section { color: rebeccapurple; }'),
+        body: Buffer.from([
+            'section {',
+            '  color: rebeccapurple;',
+            '  background-image: url("//assets.example.com/background.png");',
+            '}',
+        ].join('\n')),
         finalUrl: url,
     }));
     const manager = new WorkingCopyManager(fixture.app, DEFAULT_SETTINGS, {
@@ -160,9 +166,23 @@ test('downloads a URL theme off-vault and rewrites only the temporary snapshot',
     expect(await manager.read(copy)).toContain('![image.png](../assets/image.png)');
     expect(await fs.readFile(copy.remoteTheme?.path as string, 'utf8'))
         .toBe(copy.remoteTheme?.css);
+    expect(copy.remoteTheme?.css).toContain('https://assets.example.com/background.png');
     const marp = new Marp();
     marp.themeSet.add(copy.remoteTheme?.css as string);
     expect(marp.render(await manager.read(copy)).css).toContain('rebeccapurple');
+    expect(marp.render(await manager.read(copy)).css)
+        .toContain('https://assets.example.com/background.png');
+    const htmlPath = join(testRoot, 'remote-theme.html');
+    expect(await marpCli([
+        copy.path,
+        '--theme-set',
+        copy.remoteTheme?.path as string,
+        '--html',
+        '-o',
+        htmlPath,
+    ])).toBe(0);
+    expect(await fs.readFile(htmlPath, 'utf8'))
+        .toContain('https://assets.example.com/background.png');
     expect(writeSpy.mock.calls.every(call => call[0] !== fixture.absoluteSource)).toBe(true);
     expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
 

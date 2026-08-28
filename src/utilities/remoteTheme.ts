@@ -44,9 +44,11 @@ export interface RemoteThemeHttpResponse {
     readonly headers: Record<string, string>;
     readonly body: Buffer;
     readonly finalUrl: string;
+    /** True only when a conditional validator reached the final HTTP request. */
+    readonly validatorsSent?: boolean;
 }
 
-export type RemoteThemeHopResponse = Omit<RemoteThemeHttpResponse, 'finalUrl'>;
+export type RemoteThemeHopResponse = Omit<RemoteThemeHttpResponse, 'finalUrl' | 'validatorsSent'>;
 export type RemoteThemeRequester = (
     url: URL,
     headers: Readonly<Record<string, string>>,
@@ -59,8 +61,17 @@ export type RemoteThemeFetcher = (
     signal: AbortSignal,
 ) => Promise<RemoteThemeHttpResponse>;
 
+export interface RemoteThemeFileSystem {
+    mkdir(path: string, options: { recursive: true }): Promise<string | undefined>;
+    rename(oldPath: string, newPath: string): Promise<void>;
+    rm(path: string, options: { force: true }): Promise<void>;
+    stat(path: string): Promise<unknown>;
+    writeFile(path: string, data: string, encoding: 'utf8'): Promise<void>;
+}
+
 export interface RemoteThemeCacheOptions {
     fetcher?: RemoteThemeFetcher;
+    fileSystem?: RemoteThemeFileSystem;
     maxTtlMs?: number;
     now?: () => number;
 }
@@ -226,9 +237,29 @@ export function findRemoteThemeDirective(markdown: string): RemoteThemeDirective
         throw new RemoteThemeError('A remote theme URL must be declared in YAML front matter.');
     }
     const frontMatter = markdown.slice(bounds.start, bounds.end);
-    const themeLine = /^([\t ]*theme[\t ]*:[\t ]*)(.*)$/m.exec(frontMatter);
-    if (themeLine === null || themeLine.index === undefined) {
-        throw new RemoteThemeError('Unable to replace the remote theme directive in the working copy.');
+    const themePattern = /^(theme[\t ]*:[\t ]*)(.*)$/gm;
+    const themeLines: RegExpExecArray[] = [];
+    let candidate: RegExpExecArray | null;
+    while ((candidate = themePattern.exec(frontMatter)) !== null) {
+        themeLines.push(candidate);
+    }
+    if (themeLines.length !== 1) {
+        throw new RemoteThemeError(
+            'A remote theme must use one single-line, top-level YAML theme scalar.',
+        );
+    }
+    const themeLine = themeLines[0];
+    const rawScalar = themeLine[2];
+    let lineValue: unknown;
+    try {
+        lineValue = matter(`---\ntheme: ${rawScalar}\n---\n`).data.theme;
+    } catch {
+        lineValue = undefined;
+    }
+    if (lineValue !== configuredTheme) {
+        throw new RemoteThemeError(
+            'A remote theme must use a single-line, top-level YAML theme scalar.',
+        );
     }
 
     const valueStart = bounds.start + themeLine.index + themeLine[1].length;
@@ -274,20 +305,31 @@ function validateCssResponse(response: RemoteThemeHttpResponse): string {
     return css;
 }
 
+function validateResourceScheme(reference: string): void {
+    const trimmed = reference.trim();
+    const scheme = /^([a-z][a-z\d+.-]*):/i.exec(trimmed)?.[1].toLowerCase();
+    if (
+        scheme !== undefined &&
+        scheme !== 'data' &&
+        scheme !== 'http' &&
+        scheme !== 'https'
+    ) {
+        throw new RemoteThemeError(
+            `Remote theme CSS resource scheme "${scheme}:" is not allowed.`,
+        );
+    }
+}
+
 function rebaseReference(reference: string, baseUrl: string): string {
     const trimmed = reference.trim();
-    if (
-        trimmed === '' ||
-        trimmed.startsWith('#') ||
-        /^(?:data|blob|file|https?):/i.test(trimmed) ||
-        trimmed.startsWith('//')
-    ) {
+    validateResourceScheme(trimmed);
+    if (trimmed === '' || trimmed.startsWith('#') || /^data:/i.test(trimmed)) {
         return reference;
     }
     try {
         return new URL(trimmed, baseUrl).href;
-    } catch {
-        return reference;
+    } catch (error) {
+        throw new RemoteThemeError('Remote theme contains an invalid CSS resource URL.', error);
     }
 }
 
@@ -304,6 +346,7 @@ function rebaseUrlFunctions(
                 return match;
             }
             if (!shouldRebase(reference.trim())) {
+                validateResourceScheme(reference);
                 return match;
             }
             const rebased = rebaseReference(reference, baseUrl);
@@ -329,6 +372,7 @@ function rebaseImport(params: string, baseUrl: string): string {
     }
     return params.replace(/^(\s*)(['"])(.*?)\2/, (match, whitespace, quote, reference) => {
         if (!isCssImportPath(reference)) {
+            validateResourceScheme(reference);
             return match;
         }
         const rebased = rebaseReference(reference, baseUrl);
@@ -348,7 +392,11 @@ export function prepareRemoteThemeCss(css: string, finalUrl: string, themeName: 
     return root.toString();
 }
 
-function parseCachePolicy(headers: Readonly<Record<string, string>>, maxTtlMs: number): CachePolicy {
+function parseCachePolicy(
+    headers: Readonly<Record<string, string>>,
+    maxTtlMs: number,
+    defaultTtlMs = maxTtlMs,
+): CachePolicy {
     const directives = (headers['cache-control'] || '')
         .split(',')
         .map(value => value.trim().toLowerCase());
@@ -360,11 +408,20 @@ function parseCachePolicy(headers: Readonly<Record<string, string>>, maxTtlMs: n
         : Number(maxAgeDirective.slice('max-age='.length).replace(/^"|"$/g, ''));
     const serverTtl = maxAgeSeconds !== undefined && Number.isFinite(maxAgeSeconds) && maxAgeSeconds >= 0
         ? maxAgeSeconds * 1000
-        : maxTtlMs;
+        : defaultTtlMs;
+    const ageSeconds = Number(headers.age);
+    const ageMs = Number.isFinite(ageSeconds) && ageSeconds > 0 ? ageSeconds * 1000 : 0;
     return {
         noStore,
-        freshForMs: noCache ? 0 : Math.min(maxTtlMs, serverTtl),
+        freshForMs: noCache ? 0 : Math.max(0, Math.min(maxTtlMs, serverTtl) - ageMs),
     };
+}
+
+function hasConditionalValidator(headers: Readonly<Record<string, string>>): boolean {
+    return Object.keys(headers).some(name => {
+        const normalized = name.toLowerCase();
+        return normalized === 'if-none-match' || normalized === 'if-modified-since';
+    });
 }
 
 function abortError(): RemoteThemeError {
@@ -401,16 +458,19 @@ function waitForConsumer<T>(promise: Promise<T>, signal?: AbortSignal): Promise<
 export class RemoteThemeCache {
     private readonly getSessionRoot: () => Promise<string>;
     private readonly fetcher: RemoteThemeFetcher;
+    private readonly fileSystem: RemoteThemeFileSystem;
     private readonly maxTtlMs: number;
     private readonly now: () => number;
     private readonly entries = new Map<string, CacheEntry>();
     private readonly versions = new Map<string, ThemeVersion>();
     private readonly inFlight = new Map<string, InFlightRequest>();
+    private readonly publications = new Set<Promise<RemoteTheme>>();
     private disposed = false;
 
     constructor(getSessionRoot: () => Promise<string>, options: RemoteThemeCacheOptions = {}) {
         this.getSessionRoot = getSessionRoot;
         this.fetcher = options.fetcher || fetchRemoteTheme;
+        this.fileSystem = options.fileSystem || fs;
         this.maxTtlMs = options.maxTtlMs ?? REMOTE_THEME_MAX_TTL_MS;
         this.now = options.now || Date.now;
     }
@@ -443,6 +503,9 @@ export class RemoteThemeCache {
         request.consumers++;
         try {
             const version = await waitForConsumer(request.promise, signal);
+            if (this.disposed || signal?.aborted) {
+                throw abortError();
+            }
             return this.retain(version);
         } finally {
             request.consumers--;
@@ -468,6 +531,11 @@ export class RemoteThemeCache {
         for (const request of this.inFlight.values()) {
             request.controller.abort();
         }
+        const publications = [...this.publications];
+        await Promise.all(publications.map(publication => publication.then(
+            () => undefined,
+            () => undefined,
+        )));
     }
 
     private finishRequest(url: string, request: InFlightRequest): void {
@@ -516,12 +584,16 @@ export class RemoteThemeCache {
 
         const validatedAt = this.now();
         if (response.status === 304) {
-            if (previous === undefined) {
-                throw new RemoteThemeError('Remote theme returned 304 without a cached version.');
+            if (previous === undefined || response.validatorsSent !== true) {
+                throw new RemoteThemeError(
+                    'Remote theme returned 304 without a validator on the final request.',
+                );
             }
-            const policy = response.headers['cache-control'] === undefined
-                ? { noStore: false, freshForMs: previous.freshForMs }
-                : parseCachePolicy(response.headers, this.maxTtlMs);
+            const policy = parseCachePolicy(
+                response.headers,
+                this.maxTtlMs,
+                previous.freshForMs,
+            );
             previous.validatedAt = validatedAt;
             previous.freshUntil = validatedAt + policy.freshForMs;
             previous.freshForMs = policy.freshForMs;
@@ -541,7 +613,13 @@ export class RemoteThemeCache {
         const urlHash = hash(url);
         const themeName = `${REMOTE_THEME_NAME_PREFIX}${urlHash.slice(0, 20)}`;
         const preparedCss = prepareRemoteThemeCss(css, response.finalUrl, themeName);
-        const theme = await this.publish(url, response.finalUrl, themeName, preparedCss);
+        const theme = await this.publish(url, response.finalUrl, themeName, preparedCss, signal);
+        if (this.disposed || signal.aborted) {
+            if (!this.versions.has(theme.path)) {
+                await this.fileSystem.rm(theme.path, { force: true }).catch(() => undefined);
+            }
+            throw abortError();
+        }
         const existingVersion = this.versions.get(theme.path);
         const version = existingVersion !== undefined
             ? existingVersion
@@ -582,25 +660,65 @@ export class RemoteThemeCache {
         finalUrl: string,
         name: string,
         css: string,
+        signal: AbortSignal,
     ): Promise<RemoteTheme> {
+        const publication = this.publishFile(url, finalUrl, name, css, signal);
+        this.publications.add(publication);
+        publication.then(
+            () => this.publications.delete(publication),
+            () => this.publications.delete(publication),
+        );
+        return publication;
+    }
+
+    private async publishFile(
+        url: string,
+        finalUrl: string,
+        name: string,
+        css: string,
+        signal: AbortSignal,
+    ): Promise<RemoteTheme> {
+        const ensureActive = () => {
+            if (this.disposed || signal.aborted) {
+                throw abortError();
+            }
+        };
+        ensureActive();
         const root = await this.getSessionRoot();
+        ensureActive();
         const directory = join(root, 'themes');
-        await fs.mkdir(directory, { recursive: true });
+        await this.fileSystem.mkdir(directory, { recursive: true });
+        ensureActive();
         const path = join(directory, `${hash(url)}-${hash(css)}.css`);
         const partial = join(directory, `.${hash(url)}-${randomBytes(8).toString('hex')}.tmp`);
+        const existing = await this.fileSystem.stat(path).catch(() => undefined);
+        ensureActive();
+        if (existing !== undefined) {
+            return { url, finalUrl, name, path, css };
+        }
+        let published = false;
         try {
-            await fs.writeFile(partial, css, 'utf8');
+            await this.fileSystem.writeFile(partial, css, 'utf8');
+            ensureActive();
             try {
-                await fs.rename(partial, path);
+                await this.fileSystem.rename(partial, path);
+                published = true;
             } catch (error) {
-                const existing = await fs.stat(path).catch(() => undefined);
-                if (existing === undefined) {
+                const concurrentlyPublished = await this.fileSystem.stat(path).catch(() => undefined);
+                if (concurrentlyPublished === undefined) {
                     throw error;
                 }
-                await fs.rm(partial, { force: true });
+                await this.fileSystem.rm(partial, { force: true });
             }
+            ensureActive();
         } catch (error) {
-            await fs.rm(partial, { force: true }).catch(() => undefined);
+            await this.fileSystem.rm(partial, { force: true }).catch(() => undefined);
+            if (published && !this.versions.has(path)) {
+                await this.fileSystem.rm(path, { force: true }).catch(() => undefined);
+            }
+            if (error instanceof RemoteThemeError) {
+                throw error;
+            }
             throw new RemoteThemeError(
                 `Unable to publish the downloaded theme from ${safeUrlForMessage(url)}.`,
                 error,
@@ -614,7 +732,7 @@ export class RemoteThemeCache {
             return;
         }
         try {
-            await fs.rm(version.theme.path, { force: true });
+            await this.fileSystem.rm(version.theme.path, { force: true });
             this.versions.delete(version.theme.path);
         } catch (error) {
             console.error(`Unable to clean remote theme "${version.theme.path}".`, error);
@@ -727,7 +845,11 @@ export async function fetchRemoteThemeWith(
     for (let redirects = 0; redirects <= REMOTE_THEME_REDIRECT_LIMIT; redirects++) {
         const response = await requester(current, headers, signal);
         if (!REDIRECT_STATUSES.has(response.status)) {
-            return { ...response, finalUrl: current.href };
+            return {
+                ...response,
+                finalUrl: current.href,
+                validatorsSent: hasConditionalValidator(headers),
+            };
         }
         const location = response.headers.location;
         if (location === undefined) {
