@@ -4,7 +4,11 @@ import { get as httpGet, IncomingHttpHeaders } from 'http';
 import { get as httpsGet } from 'https';
 import { join } from 'path';
 import postcss from 'postcss';
+import valueParser from 'postcss-value-parser';
 import matter from 'gray-matter';
+
+type CssValueNode = ReturnType<typeof valueParser>['nodes'][number];
+type CssFunctionNode = Extract<CssValueNode, { type: 'function' }>;
 
 export const REMOTE_THEME_MAX_TTL_MS = 5 * 60 * 1000;
 export const REMOTE_THEME_MAX_BYTES = 5 * 1024 * 1024;
@@ -203,6 +207,10 @@ function trailingYamlComment(value: string): string {
                 escaped = true;
                 continue;
             }
+            if (quote === "'" && character === quote && trimmedStart[index + 1] === quote) {
+                index++;
+                continue;
+            }
             if (character === quote && !escaped) {
                 return trimmedStart.slice(index + 1);
             }
@@ -250,6 +258,24 @@ export function findRemoteThemeDirective(markdown: string): RemoteThemeDirective
     }
     const themeLine = themeLines[0];
     const rawScalar = themeLine[2];
+    const comment = trailingYamlComment(rawScalar);
+    if (comment !== '' && !/^[\t ]*(?:#.*)?$/.test(comment)) {
+        throw new RemoteThemeError(
+            'A remote theme must use a single-line, top-level YAML theme scalar without YAML decorations.',
+        );
+    }
+    const scalar = rawScalar.slice(0, rawScalar.length - comment.length).trim();
+    const quoted = scalar.startsWith('"') || scalar.startsWith("'");
+    if (
+        scalar === '' ||
+        (!quoted && scalar !== configuredTheme) ||
+        (quoted && scalar[scalar.length - 1] !== scalar[0]) ||
+        ['&', '*', '!', '>', '|', '{', '['].includes(scalar[0])
+    ) {
+        throw new RemoteThemeError(
+            'A remote theme must use a single-line, top-level YAML theme scalar without YAML decorations.',
+        );
+    }
     let lineValue: unknown;
     try {
         lineValue = matter(`---\ntheme: ${rawScalar}\n---\n`).data.theme;
@@ -264,7 +290,6 @@ export function findRemoteThemeDirective(markdown: string): RemoteThemeDirective
 
     const valueStart = bounds.start + themeLine.index + themeLine[1].length;
     const valueEnd = valueStart + themeLine[2].length;
-    const comment = trailingYamlComment(themeLine[2]);
     return {
         url,
         replace: (source, themeName) =>
@@ -333,30 +358,58 @@ function rebaseReference(reference: string, baseUrl: string): string {
     }
 }
 
+function decodeCssEscapes(value: string): string {
+    return value.replace(
+        /\\(?:([\da-f]{1,6})(?:\r\n|[\t\n\f\r ])?|\r\n|[\n\f\r]|(.))/gi,
+        (_match, hexadecimal: string | undefined, escaped: string | undefined) => {
+            if (hexadecimal !== undefined) {
+                const codePoint = Number.parseInt(hexadecimal, 16);
+                return codePoint === 0 || codePoint > 0x10FFFF
+                    ? '\uFFFD'
+                    : String.fromCodePoint(codePoint);
+            }
+            return escaped || '';
+        },
+    );
+}
+
+function cssResourceReference(node: CssFunctionNode): string {
+    if (node.unclosed) {
+        throw new RemoteThemeError('Remote theme contains an invalid CSS resource URL.');
+    }
+    const meaningfulNodes = node.nodes.filter(child => child.type !== 'space' && child.type !== 'comment');
+    const serialized = meaningfulNodes.length === 1 && meaningfulNodes[0].type === 'string'
+        ? meaningfulNodes[0].value
+        : valueParser.stringify(node.nodes).trim();
+    return decodeCssEscapes(serialized);
+}
+
 function rebaseUrlFunctions(
     value: string,
     baseUrl: string,
     shouldRebase: (reference: string) => boolean = () => true,
 ): string {
-    return value.replace(
-        /url\(\s*(?:(['"])(.*?)\1|([^)]*?))\s*\)/gi,
-        (match, quote: string | undefined, quoted: string | undefined, unquoted: string | undefined) => {
-            const reference = quoted === undefined ? unquoted : quoted;
-            if (reference === undefined) {
-                return match;
-            }
-            if (!shouldRebase(reference.trim())) {
-                validateResourceScheme(reference);
-                return match;
-            }
-            const rebased = rebaseReference(reference, baseUrl);
-            if (rebased === reference) {
-                return match;
-            }
-            const escaped = rebased.replace(/"/g, '\\"');
-            return `url("${escaped}")`;
-        },
-    );
+    const parsed = valueParser(value);
+    parsed.walk(node => {
+        if (node.type !== 'function' || decodeCssEscapes(node.value).toLowerCase() !== 'url') {
+            return;
+        }
+        const reference = cssResourceReference(node);
+        if (!shouldRebase(reference.trim())) {
+            validateResourceScheme(reference);
+            return false;
+        }
+        const rebased = rebaseReference(reference, baseUrl);
+        if (rebased !== reference || node.value !== 'url') {
+            const escaped = rebased.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            node.value = 'url';
+            node.before = '';
+            node.after = '';
+            node.nodes = valueParser(`"${escaped}"`).nodes;
+        }
+        return false;
+    });
+    return valueParser.stringify(parsed.nodes);
 }
 
 function isCssImportPath(reference: string): boolean {
@@ -367,17 +420,24 @@ function isCssImportPath(reference: string): boolean {
 
 function rebaseImport(params: string, baseUrl: string): string {
     const rebasedFunctions = rebaseUrlFunctions(params, baseUrl, isCssImportPath);
-    if (rebasedFunctions !== params || /^\s*url\(/i.test(params)) {
+    const parsed = valueParser(rebasedFunctions);
+    const first = parsed.nodes.find(node => node.type !== 'space' && node.type !== 'comment');
+    if (
+        rebasedFunctions !== params ||
+        (first?.type === 'function' && decodeCssEscapes(first.value).toLowerCase() === 'url')
+    ) {
         return rebasedFunctions;
     }
-    return params.replace(/^(\s*)(['"])(.*?)\2/, (match, whitespace, quote, reference) => {
-        if (!isCssImportPath(reference)) {
-            validateResourceScheme(reference);
-            return match;
-        }
-        const rebased = rebaseReference(reference, baseUrl);
-        return rebased === reference ? match : `${whitespace}${quote}${rebased}${quote}`;
-    });
+    if (first?.type !== 'string') {
+        return rebasedFunctions;
+    }
+    const reference = decodeCssEscapes(first.value);
+    if (!isCssImportPath(reference)) {
+        validateResourceScheme(reference);
+        return rebasedFunctions;
+    }
+    first.value = rebaseReference(reference, baseUrl);
+    return valueParser.stringify(parsed.nodes);
 }
 
 export function prepareRemoteThemeCss(css: string, finalUrl: string, themeName: string): string {
@@ -385,8 +445,10 @@ export function prepareRemoteThemeCss(css: string, finalUrl: string, themeName: 
     root.walkDecls(declaration => {
         declaration.value = rebaseUrlFunctions(declaration.value, finalUrl);
     });
-    root.walkAtRules('import', rule => {
-        rule.params = rebaseImport(rule.params, finalUrl);
+    root.walkAtRules(rule => {
+        rule.params = decodeCssEscapes(rule.name).toLowerCase() === 'import'
+            ? rebaseImport(rule.params, finalUrl)
+            : rebaseUrlFunctions(rule.params, finalUrl);
     });
     root.append({ text: `@theme ${themeName}` });
     return root.toString();

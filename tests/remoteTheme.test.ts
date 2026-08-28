@@ -112,6 +112,17 @@ test('rewrites a URL theme only in the working snapshot and preserves YAML comme
         '  https://cdn.example.com/folded.css',
         '---',
     ].join('\n'))).toThrow('single-line, top-level YAML theme scalar');
+    expect(() => findRemoteThemeDirective([
+        '---',
+        'theme: &remote https://example.com/a.css',
+        'copy: *remote',
+        '---',
+    ].join('\n'))).toThrow('without YAML decorations');
+    expect(() => findRemoteThemeDirective([
+        '---',
+        'theme: !!str https://example.com/tagged.css',
+        '---',
+    ].join('\n'))).toThrow('without YAML decorations');
 });
 
 test('caches fresh CSS, conditionally revalidates, and publishes immutable updated versions', async () => {
@@ -242,6 +253,25 @@ test('retains the previous short freshness policy when a 304 omits Cache-Control
     expect(fetcher).toHaveBeenCalledTimes(3);
 });
 
+test('subtracts HTTP Age from the advertised cache lifetime', async () => {
+    let now = 0;
+    const fetcher = jest.fn(async () => response('section {}', {
+        age: '59',
+        'cache-control': 'max-age=60',
+        'content-type': 'text/css',
+    }));
+    const cache = new RemoteThemeCache(async () => testRoot, { fetcher, now: () => now });
+    const url = 'https://aged.example/theme.css';
+
+    await cache.release(await cache.acquire(url));
+    now = 999;
+    await cache.release(await cache.acquire(url));
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    now = 1_001;
+    await cache.release(await cache.acquire(url));
+    expect(fetcher).toHaveBeenCalledTimes(2);
+});
+
 test('deduplicates overlapping no-store leases for identical CSS without early removal', async () => {
     const fetcher: RemoteThemeFetcher = jest.fn(async () => response(
         'section { color: green }',
@@ -336,6 +366,8 @@ test('rebases protocol-relative CSS resources and rejects local or executable sc
         'section { background: url(file:///etc/passwd) }',
         'section { background: url(blob:https://example.com/id) }',
         '@import "javascript:alert(1)";',
+        '@IMPORT "file:///tmp/local.css";',
+        'section { background: u\\72l(file:///etc/passwd) }',
     ]) {
         expect(() => prepareRemoteThemeCss(
             unsafe,

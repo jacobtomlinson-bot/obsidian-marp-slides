@@ -261,3 +261,26 @@ test('every export mode uses the same cached local file for a URL-backed theme',
     await fixture.manager.dispose();
     await expect(fs.stat(themePath)).rejects.toMatchObject({ code: 'ENOENT' });
 });
+
+test.each([
+    '@IMPORT "file:///tmp/local.css";',
+    'section { background: u\\72l(file:///etc/passwd) }',
+])('never invokes the CLI for decoded unsafe remote CSS: %s', async css => {
+    const source = '---\ntheme: https://cdn.example.com/unsafe.css\n---\n# Unsafe';
+    const fixture = await makeFixture('relative', source, {
+        fetcher: async url => ({
+            status: 200,
+            headers: { 'content-type': 'text/css' },
+            body: Buffer.from(css),
+            finalUrl: url,
+        }),
+    });
+    const cli: MarpCliRunner = jest.fn(async () => 0);
+
+    await expect(
+        new MarpExport(fixture.settings, fixture.manager, cli).export(fixture.file, 'html'),
+    ).rejects.toThrow('is not allowed');
+    expect(cli).not.toHaveBeenCalled();
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(fixture.originalBytes);
+    await fixture.manager.dispose();
+});

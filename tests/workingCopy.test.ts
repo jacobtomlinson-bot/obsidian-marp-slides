@@ -207,3 +207,78 @@ test('remote theme acquisition failures preserve source bytes and leave no worki
     expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
     await manager.dispose();
 });
+
+test('rejects anchored remote-theme YAML without rewriting or downloading', async () => {
+    const content = [
+        '---',
+        'theme: &remote https://example.com/a.css',
+        'copy: *remote',
+        '---',
+        '# Deck',
+    ].join('\n');
+    const fixture = makeFixture('decks/anchored.md', content);
+    await fs.mkdir(join(fixture.absoluteSource, '..'), { recursive: true });
+    const originalBytes = Buffer.from(content, 'utf8');
+    await fs.writeFile(fixture.absoluteSource, originalBytes);
+    const writeSpy = jest.spyOn(fs, 'writeFile');
+    const fetcher: RemoteThemeFetcher = jest.fn();
+    const manager = new WorkingCopyManager(fixture.app, DEFAULT_SETTINGS, {
+        temporaryDirectory: testRoot,
+        fetcher,
+    });
+
+    await expect(manager.create(fixture.file)).rejects.toThrow(
+        'without YAML decorations',
+    );
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(writeSpy.mock.calls.every(call => call[0] !== fixture.absoluteSource)).toBe(true);
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
+
+    await manager.dispose();
+    writeSpy.mockRestore();
+});
+
+test.each([
+    '@IMPORT "file:///tmp/local.css";',
+    'section { background: u\\72l(file:///etc/passwd) }',
+])('rejects decoded unsafe remote CSS before real Core or CLI can receive it: %s', async css => {
+    // Both bundled renderers preserve these references, so acquisition must reject them.
+    const rawTheme = `/* @theme unsafe-real */\n${css}`;
+    const marp = new Marp();
+    marp.themeSet.add(rawTheme);
+    expect(marp.render('---\ntheme: unsafe-real\n---\n# Raw').css).toContain('file:///');
+    const rawThemePath = join(testRoot, 'raw-unsafe.css');
+    const rawDeckPath = join(testRoot, 'raw-unsafe.md');
+    const rawHtmlPath = join(testRoot, 'raw-unsafe.html');
+    await fs.writeFile(rawThemePath, rawTheme, 'utf8');
+    await fs.writeFile(rawDeckPath, '---\ntheme: unsafe-real\n---\n# Raw', 'utf8');
+    expect(await marpCli([
+        rawDeckPath,
+        '--theme-set',
+        rawThemePath,
+        '--allow-local-files',
+        '--html',
+        '-o',
+        rawHtmlPath,
+    ])).toBe(0);
+    expect(await fs.readFile(rawHtmlPath, 'utf8')).toContain('file:///');
+
+    const content = '---\ntheme: https://themes.example.com/unsafe.css\n---\n# Deck';
+    const fixture = makeFixture('decks/unsafe.md', content);
+    await fs.mkdir(join(fixture.absoluteSource, '..'), { recursive: true });
+    const originalBytes = Buffer.from(content, 'utf8');
+    await fs.writeFile(fixture.absoluteSource, originalBytes);
+    const manager = new WorkingCopyManager(fixture.app, DEFAULT_SETTINGS, {
+        temporaryDirectory: testRoot,
+        fetcher: async url => ({
+            status: 200,
+            headers: { 'content-type': 'text/css' },
+            body: Buffer.from(css),
+            finalUrl: url,
+        }),
+    });
+
+    await expect(manager.create(fixture.file)).rejects.toThrow('is not allowed');
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
+    await manager.dispose();
+});
