@@ -1,7 +1,7 @@
 jest.mock('@marp-team/marp-core', () => ({
     Marp: jest.fn().mockImplementation(() => ({
         render: (markdown: string) => ({ html: `<section>${markdown}</section>`, css: 'slide{}' }),
-        themeSet: { add: jest.fn() },
+        themeSet: { add: jest.fn(), delete: jest.fn() },
         use: jest.fn().mockReturnThis(),
     })),
 }));
@@ -10,6 +10,7 @@ jest.mock('@marp-team/marp-core/browser', () => ({
     browser: jest.fn(() => ({ update: jest.fn() })),
 }));
 
+import { Marp } from '@marp-team/marp-core';
 import { App, MarkdownView, TFile, Vault, WorkspaceLeaf } from 'obsidian';
 import { MarpExport } from '../src/utilities/marpExport';
 import { DEFAULT_SETTINGS } from '../src/utilities/settings';
@@ -210,4 +211,108 @@ test('a deferred failed note switch cannot export or retain the previous note', 
     expect(exporter.export).not.toHaveBeenCalled();
     expect(preview.isDisplaying(first)).toBe(false);
     expect(preview.isDisplaying(second)).toBe(false);
+});
+
+test('preview registers the exact cached remote CSS and retires it on a local-theme refresh', async () => {
+    const remoteFile = makeFile('remote/deck.md');
+    const nextRemoteFile = makeFile('remote/next.md');
+    const localFile = makeFile('local/deck.md');
+    const remoteTheme = {
+        url: 'https://themes.example.com/deck.css',
+        finalUrl: 'https://themes.example.com/deck.css',
+        name: 'obsidian-marp-remote-1234',
+        path: '/tmp/session/themes/remote.css',
+        css: 'section { color: purple } /* @theme obsidian-marp-remote-1234 */',
+    };
+    const nextRemoteTheme = {
+        ...remoteTheme,
+        url: 'https://themes.example.com/next.css',
+        finalUrl: 'https://themes.example.com/next.css',
+        name: 'obsidian-marp-remote-5678',
+        path: '/tmp/session/themes/next.css',
+        css: 'section { color: orange } /* @theme obsidian-marp-remote-5678 */',
+    };
+    const provider: WorkingCopyProvider = {
+        create: jest.fn(async file => ({
+            directory: `/tmp/${file.parent?.path}`,
+            path: `/tmp/${file.path}`,
+            sourcePath: file.path,
+            remoteTheme: file === remoteFile
+                ? remoteTheme
+                : file === nextRemoteFile ? nextRemoteTheme : undefined,
+        })),
+        read: jest.fn(async copy => copy.remoteTheme === undefined
+            ? '---\ntheme: gaia\n---\n# Local'
+            : `---\ntheme: ${copy.remoteTheme.name}\n---\n# Remote`),
+        cleanup: jest.fn(async () => undefined),
+    };
+    const { content, root } = makeContainer();
+    const leaf = {
+        app: { metadataCache: {} } as App,
+        containerEl: root,
+    } as unknown as WorkspaceLeaf;
+    const preview = new MarpPreviewView(
+        DEFAULT_SETTINGS,
+        leaf,
+        provider,
+        { export: jest.fn() } as unknown as MarpExport,
+    );
+    const marpInstance = (Marp as unknown as jest.Mock).mock.results.slice(-1)[0].value;
+
+    await preview.displaySlides(makeView(remoteFile, '# Remote source'));
+    expect(marpInstance.themeSet.add).toHaveBeenCalledWith(remoteTheme.css);
+    expect(content.innerHTML).toContain(remoteTheme.name);
+
+    await preview.displaySlides(makeView(nextRemoteFile, '# Next remote source'));
+    expect(marpInstance.themeSet.delete).toHaveBeenCalledWith(remoteTheme.name);
+    expect(marpInstance.themeSet.add).toHaveBeenCalledWith(nextRemoteTheme.css);
+    expect(content.innerHTML).toContain(nextRemoteTheme.name);
+
+    await preview.displaySlides(makeView(localFile, '# Local source'));
+    expect(marpInstance.themeSet.delete).toHaveBeenCalledWith(nextRemoteTheme.name);
+    expect(content.innerHTML).toContain('theme: gaia');
+    await preview.onClose();
+});
+
+test('a newer preview generation cancels unused remote acquisition without surfacing a stale error', async () => {
+    const firstFile = makeFile('remote/first.md');
+    const secondFile = makeFile('remote/second.md');
+    let firstSignal: AbortSignal | undefined;
+    const secondCopy = {
+        directory: '/tmp/second',
+        path: '/tmp/second/second.md',
+        sourcePath: secondFile.path,
+    };
+    const provider: WorkingCopyProvider = {
+        create: jest.fn(async (file, _source, signal) => {
+            if (file === secondFile) {
+                return secondCopy;
+            }
+            firstSignal = signal;
+            return new Promise<WorkingCopy>((_resolve, reject) => {
+                signal?.addEventListener('abort', () => reject(new Error('cancelled remote fetch')));
+            });
+        }),
+        read: jest.fn(async copy => copy.sourcePath),
+        cleanup: jest.fn(async () => undefined),
+    };
+    const { content, root } = makeContainer();
+    const preview = new MarpPreviewView(
+        DEFAULT_SETTINGS,
+        {
+            app: { metadataCache: {} } as App,
+            containerEl: root,
+        } as unknown as WorkspaceLeaf,
+        provider,
+        { export: jest.fn() } as unknown as MarpExport,
+    );
+
+    const firstRender = preview.displaySlides(makeView(firstFile, 'first'));
+    const secondRender = preview.displaySlides(makeView(secondFile, 'second'));
+    await Promise.all([firstRender, secondRender]);
+
+    expect(firstSignal?.aborted).toBe(true);
+    expect(content.innerHTML).toContain(secondFile.path);
+    expect(content.innerHTML).not.toContain('Unable to refresh');
+    await preview.onClose();
 });

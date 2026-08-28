@@ -49,16 +49,16 @@
 **Preview Pipeline:**
 1. User opens Markdown file and triggers "Slide Preview" command
 2. `MarpSlides` retrieves active `MarkdownView` and creates `MarpPreviewView`
-3. `WorkingCopyManager` writes a converted, unique snapshot outside the vault
-4. `MarpPreviewView` reads that snapshot and uses Marp Core to render Markdown → HTML/CSS
+3. `WorkingCopyManager` writes a converted, unique snapshot outside the vault and resolves any URL-backed theme through `RemoteThemeCache`
+4. `MarpPreviewView` registers the leased local theme CSS, reads the snapshot, and uses Marp Core to render Markdown → HTML/CSS
 5. Rendered slides use the original note or vault base path for assets
 6. Modify, file-open, rename, and delete events refresh or clear the preview; generation checks discard late work
 
 **Export Pipeline:**
 1. User triggers export command (PDF/HTML/PPTX/PNG)
-2. The shared `WorkingCopyManager` snapshots and converts the current note
-3. `FilePath` resolves the original resource base, themes, and explicit user-visible output path
-4. The shared `MarpExport` invokes Marp CLI with the temporary input and original base URL
+2. The shared `WorkingCopyManager` snapshots and converts the current note, acquiring the same validator-aware remote-theme cache when required
+3. `FilePath` resolves the original resource base, local themes, and explicit user-visible output path
+4. The shared `MarpExport` invokes Marp CLI with the temporary input, any leased local remote-theme file, and original base URL
 5. Marp CLI uses Chrome/Chromium for PDF/PPTX rendering
 6. The operation removes its owned temporary directory in `finally`, on success or failure
 
@@ -76,6 +76,7 @@ obsidian-marp-slides/
 │   │   ├── settings.ts              # Settings interface and defaults
 │   │   ├── marpExport.ts            # Export functionality (PDF, HTML, PPTX, PNG)
 │   │   ├── filePath.ts              # File/path resolution utilities
+│   │   ├── remoteTheme.ts           # Owned URL-theme download, validation, and cache lifecycle
 │   │   ├── workingCopy.ts           # Isolated temporary Markdown snapshots
 │   │   ├── libs.ts                  # External library management
 │   │   └── icons.ts                 # SVG icon definitions
@@ -84,6 +85,7 @@ obsidian-marp-slides/
 ├── tests/
 │   ├── filePath.test.ts             # Path and wiki-image conversion tests
 │   ├── workingCopy.test.ts           # Isolation, immutability, and cleanup tests
+│   ├── remoteTheme.test.ts           # URL validation, revalidation, redirects, and leases
 │   ├── marpExport.test.ts            # Export parity and failure tests
 │   ├── marpPreviewView.test.ts       # Preview refresh and race tests
 │   └── __mocks__/
@@ -141,10 +143,11 @@ Custom view for rendering slides, extending Obsidian's `ItemView`.
 
 **Responsibilities:**
 - Marp Core initialization and configuration
-- Theme loading from vault
+- Theme loading from the vault and leased URL-theme versions from temporary storage
 - Working-copy refresh and slide rendering (Markdown → HTML)
 - Generation-based stale refresh rejection
 - Working-copy cleanup on switch, failure, clear, and close
+- Remote-theme replacement without retaining stale named themes
 - Cursor-to-slide synchronization
 - Export action buttons
 
@@ -238,6 +241,21 @@ Utility class for file and path resolution.
 | `getExportPath()` | Directs output away from the temporary input directory |
 | `convertImageWikiLinks()` | Converts only resolved image embeds in a supplied snapshot |
 | `getThemePath()` | Resolves custom theme directory |
+
+---
+
+### RemoteThemeCache (`src/utilities/remoteTheme.ts`)
+
+Resolves an HTTP(S) URL in a deck's top-level YAML `theme` directive without changing the vault note. CSS is validated, rebased against the final response URL, assigned a stable synthetic theme name, and atomically published beneath the plugin-owned temporary session root.
+
+- Collision-resistant URL and content hashes keep different sources and immutable versions isolated.
+- Fresh entries avoid network work; the maximum TTL is five minutes and server policy may shorten it.
+- Expired entries use `If-None-Match` and `If-Modified-Since`; `304` retains exact bytes and `200` publishes a new immutable version.
+- Same-URL requests share one in-flight operation. Preview refresh cancellation and plugin unload abort unused work.
+- Working copies lease versions. Superseded or `no-store` files are removed only after the final preview/export consumer releases them.
+- Redirect, timeout, response-size, content-type, CSS syntax, scheme, and credential checks fail before Marp receives a path.
+
+The CLI receives the downloaded file directly via `--theme-set`; Marp Core receives the exact same CSS bytes. Existing named themes and `ThemePath` directories remain unchanged and network-free.
 
 ---
 

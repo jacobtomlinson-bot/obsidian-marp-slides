@@ -24,6 +24,8 @@ export class MarpPreviewView extends ItemView  {
     private requestedFile: TFile | undefined;
     private workingCopy: WorkingCopy | undefined;
     private renderGeneration = 0;
+    private renderAbortController: AbortController | undefined;
+    private activeRemoteThemeName: string | undefined;
     private readonly workingCopies: WorkingCopyProvider;
     private readonly exporter: MarpExport;
 
@@ -92,6 +94,9 @@ export class MarpPreviewView extends ItemView  {
 
     async onClose() {
         this.renderGeneration++;
+        this.renderAbortController?.abort();
+        this.renderAbortController = undefined;
+        this.clearRemoteTheme();
         const workingCopy = this.workingCopy;
         this.workingCopy = undefined;
         this.file = undefined;
@@ -137,6 +142,9 @@ export class MarpPreviewView extends ItemView  {
 
     async clear(): Promise<void> {
         this.renderGeneration++;
+        this.renderAbortController?.abort();
+        this.renderAbortController = undefined;
+        this.clearRemoteTheme();
         const workingCopy = this.workingCopy;
         this.workingCopy = undefined;
         this.file = undefined;
@@ -160,6 +168,9 @@ export class MarpPreviewView extends ItemView  {
         }
 
         const generation = ++this.renderGeneration;
+        this.renderAbortController?.abort();
+        const abortController = new AbortController();
+        this.renderAbortController = abortController;
         const switchingNotes =
             (this.file !== undefined && !this.sameFile(this.file, view.file)) ||
             (this.requestedFile !== undefined && !this.sameFile(this.requestedFile, view.file));
@@ -182,7 +193,7 @@ export class MarpPreviewView extends ItemView  {
                 return;
             }
 
-            nextCopy = await this.workingCopies.create(view.file, view.data);
+            nextCopy = await this.workingCopies.create(view.file, view.data, abortController.signal);
             const processedMarkdown = await this.workingCopies.read(nextCopy);
 
             if (generation !== this.renderGeneration) {
@@ -192,6 +203,7 @@ export class MarpPreviewView extends ItemView  {
 
             const filePath = new FilePath(this.settings);
             const basePath = filePath.getCompleteFileBasePath(view.file);
+            this.setRemoteTheme(nextCopy);
             let { html, css } = this.marp.render(processedMarkdown);
 
             // Replace Background Url for images
@@ -217,6 +229,9 @@ export class MarpPreviewView extends ItemView  {
             this.workingCopy = nextCopy;
             nextCopy = undefined;
             this.file = view.file;
+            if (generation === this.renderGeneration) {
+                this.renderAbortController = undefined;
+            }
 
             if (previousCopy !== undefined) {
                 await this.workingCopies.cleanup(previousCopy);
@@ -225,17 +240,20 @@ export class MarpPreviewView extends ItemView  {
             if (nextCopy !== undefined) {
                 await this.workingCopies.cleanup(nextCopy);
             }
-            if (generation === this.renderGeneration) {
-                const staleCopy = this.workingCopy;
-                this.workingCopy = undefined;
-                this.file = undefined;
-                this.requestedFile = undefined;
-                const container = this.containerEl.children[1];
-                container.empty();
-                container.createEl('p', { text: `Unable to refresh Marp preview: ${this.errorMessage(error)}` });
-                if (staleCopy !== undefined) {
-                    await this.workingCopies.cleanup(staleCopy);
-                }
+            if (generation !== this.renderGeneration) {
+                return;
+            }
+            this.renderAbortController = undefined;
+            this.clearRemoteTheme();
+            const staleCopy = this.workingCopy;
+            this.workingCopy = undefined;
+            this.file = undefined;
+            this.requestedFile = undefined;
+            const container = this.containerEl.children[1];
+            container.empty();
+            container.createEl('p', { text: `Unable to refresh Marp preview: ${this.errorMessage(error)}` });
+            if (staleCopy !== undefined) {
+                await this.workingCopies.cleanup(staleCopy);
             }
             throw error;
         }
@@ -257,5 +275,26 @@ export class MarpPreviewView extends ItemView  {
 
     private sameFile(left: TFile, right: TFile): boolean {
         return left === right || left.path === right.path;
+    }
+
+    private setRemoteTheme(copy: WorkingCopy): void {
+        const nextTheme = copy.remoteTheme;
+        if (
+            this.activeRemoteThemeName !== undefined &&
+            this.activeRemoteThemeName !== nextTheme?.name
+        ) {
+            this.marp.themeSet.delete(this.activeRemoteThemeName);
+        }
+        if (nextTheme !== undefined) {
+            this.marp.themeSet.add(nextTheme.css);
+        }
+        this.activeRemoteThemeName = nextTheme?.name;
+    }
+
+    private clearRemoteTheme(): void {
+        if (this.activeRemoteThemeName !== undefined) {
+            this.marp.themeSet.delete(this.activeRemoteThemeName);
+            this.activeRemoteThemeName = undefined;
+        }
     }
 }

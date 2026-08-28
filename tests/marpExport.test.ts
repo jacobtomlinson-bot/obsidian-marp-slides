@@ -5,7 +5,8 @@ import { pathToFileURL } from 'url';
 import { App, TFile, Vault } from 'obsidian';
 import { MarpCliRunner, MarpExport } from '../src/utilities/marpExport';
 import { DEFAULT_SETTINGS, MarpSlidesSettings } from '../src/utilities/settings';
-import { WorkingCopyManager } from '../src/utilities/workingCopy';
+import { WorkingCopyManager, WorkingCopyOptions } from '../src/utilities/workingCopy';
+import { RemoteThemeFetcher } from '../src/utilities/remoteTheme';
 
 let testRoot: string;
 
@@ -17,11 +18,15 @@ afterEach(async () => {
     await fs.rm(testRoot, { recursive: true, force: true });
 });
 
-async function makeFixture(linkFormat: 'relative' | 'absolute' = 'relative') {
+async function makeFixture(
+    linkFormat: 'relative' | 'absolute' = 'relative',
+    source = '# Deck\r\n\r\n![[image.png]]\r\n',
+    managerOptions: WorkingCopyOptions = {},
+) {
     const vaultRoot = join(testRoot, 'vault');
     const sourcePath = 'decks/my deck.md';
     const absoluteSource = join(vaultRoot, ...sourcePath.split('/'));
-    const originalBytes = Buffer.from('# Deck\r\n\r\n![[image.png]]\r\n', 'utf8');
+    const originalBytes = Buffer.from(source, 'utf8');
     await fs.mkdir(dirname(absoluteSource), { recursive: true });
     await fs.writeFile(absoluteSource, originalBytes);
 
@@ -54,7 +59,10 @@ async function makeFixture(linkFormat: 'relative' | 'absolute' = 'relative') {
         },
     } as unknown as App;
     const settings: MarpSlidesSettings = { ...DEFAULT_SETTINGS };
-    const manager = new WorkingCopyManager(app, settings, { temporaryDirectory: testRoot });
+    const manager = new WorkingCopyManager(app, settings, {
+        ...managerOptions,
+        temporaryDirectory: testRoot,
+    });
 
     return { absoluteSource, file, manager, originalBytes, settings, vaultRoot };
 }
@@ -212,4 +220,44 @@ test('does not invoke Marp or stale input when source synchronization fails', as
     ).rejects.toThrow('Unable to create a temporary Marp working copy');
     expect(cli).not.toHaveBeenCalled();
     await fixture.manager.dispose();
+});
+
+test('every export mode uses the same cached local file for a URL-backed theme', async () => {
+    const source = [
+        '---',
+        'marp: true',
+        'theme: https://cdn.example.com/themes/space%20theme.css?v=1',
+        '---',
+        '# Remote theme',
+    ].join('\n');
+    const fetcher: RemoteThemeFetcher = jest.fn(async url => ({
+        status: 200,
+        headers: { 'cache-control': 'max-age=3600', 'content-type': 'text/css' },
+        body: Buffer.from('section { background: tomato; }'),
+        finalUrl: url,
+    }));
+    const fixture = await makeFixture('relative', source, { fetcher });
+    const themePaths = new Set<string>();
+    const cli: MarpCliRunner = jest.fn(async argv => {
+        const themeFlag = argv.lastIndexOf('--theme-set');
+        const themePath = argv[themeFlag + 1];
+        themePaths.add(themePath);
+        expect(themePath).not.toContain(fixture.vaultRoot);
+        expect(await fs.readFile(themePath, 'utf8')).toContain('background: tomato');
+        expect(await fs.readFile(argv[0], 'utf8'))
+            .toMatch(/theme: obsidian-marp-remote-[a-f0-9]+/);
+        return 0;
+    });
+    const exporter = new MarpExport(fixture.settings, fixture.manager, cli);
+
+    for (const { type } of cases) {
+        await exporter.export(fixture.file, type);
+    }
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(themePaths.size).toBe(1);
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(fixture.originalBytes);
+    const themePath = [...themePaths][0];
+    await fixture.manager.dispose();
+    await expect(fs.stat(themePath)).rejects.toMatchObject({ code: 'ENOENT' });
 });

@@ -5,6 +5,7 @@ import { App, TFile, Vault } from 'obsidian';
 import { Marp } from '@marp-team/marp-core';
 import { DEFAULT_SETTINGS } from '../src/utilities/settings';
 import { WorkingCopyManager } from '../src/utilities/workingCopy';
+import { RemoteThemeFetcher } from '../src/utilities/remoteTheme';
 
 let testRoot: string;
 
@@ -123,5 +124,66 @@ test('fails closed when the source cannot be read and leaves no usable copy', as
     await expect(manager.create(fixture.file)).rejects.toThrow(
         'Unable to create a temporary Marp working copy',
     );
+    await manager.dispose();
+});
+
+test('downloads a URL theme off-vault and rewrites only the temporary snapshot', async () => {
+    const content = [
+        '---',
+        'marp: true',
+        'theme: https://themes.example.com/remote.css',
+        '---',
+        '# Deck',
+        '![[image.png]]',
+    ].join('\r\n');
+    const fixture = makeFixture('decks/remote.md', content);
+    await fs.mkdir(join(fixture.absoluteSource, '..'), { recursive: true });
+    const originalBytes = Buffer.from(content, 'utf8');
+    await fs.writeFile(fixture.absoluteSource, originalBytes);
+    const writeSpy = jest.spyOn(fs, 'writeFile');
+    const fetcher: RemoteThemeFetcher = jest.fn(async url => ({
+        status: 200,
+        headers: { 'content-type': 'text/css', etag: '"remote-v1"' },
+        body: Buffer.from('section { color: rebeccapurple; }'),
+        finalUrl: url,
+    }));
+    const manager = new WorkingCopyManager(fixture.app, DEFAULT_SETTINGS, {
+        temporaryDirectory: testRoot,
+        fetcher,
+    });
+
+    const copy = await manager.create(fixture.file);
+
+    expect(copy.remoteTheme?.path.startsWith(testRoot)).toBe(true);
+    expect(copy.remoteTheme?.path).not.toContain(fixture.absoluteSource);
+    expect(await manager.read(copy)).toContain(`theme: ${copy.remoteTheme?.name}`);
+    expect(await manager.read(copy)).toContain('![image.png](../assets/image.png)');
+    expect(await fs.readFile(copy.remoteTheme?.path as string, 'utf8'))
+        .toBe(copy.remoteTheme?.css);
+    const marp = new Marp();
+    marp.themeSet.add(copy.remoteTheme?.css as string);
+    expect(marp.render(await manager.read(copy)).css).toContain('rebeccapurple');
+    expect(writeSpy.mock.calls.every(call => call[0] !== fixture.absoluteSource)).toBe(true);
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
+
+    await manager.cleanup(copy);
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
+    await manager.dispose();
+    writeSpy.mockRestore();
+});
+
+test('remote theme acquisition failures preserve source bytes and leave no working copy', async () => {
+    const content = '---\ntheme: https://themes.example.com/fail.css\n---\n# Deck';
+    const fixture = makeFixture('decks/fail.md', content);
+    await fs.mkdir(join(fixture.absoluteSource, '..'), { recursive: true });
+    const originalBytes = Buffer.from(content, 'utf8');
+    await fs.writeFile(fixture.absoluteSource, originalBytes);
+    const manager = new WorkingCopyManager(fixture.app, DEFAULT_SETTINGS, {
+        temporaryDirectory: testRoot,
+        fetcher: async () => { throw new Error('network unavailable'); },
+    });
+
+    await expect(manager.create(fixture.file)).rejects.toThrow('Unable to create a temporary Marp working copy');
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
     await manager.dispose();
 });

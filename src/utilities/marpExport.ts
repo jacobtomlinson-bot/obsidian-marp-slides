@@ -2,7 +2,7 @@ import marpCli, { CLIError, CLIErrorCode } from '@marp-team/marp-cli';
 import { TFile } from 'obsidian';
 import { MarpSlidesSettings } from './settings';
 import { FilePath } from './filePath';
-import { WorkingCopyProvider } from './workingCopy';
+import { WorkingCopy, WorkingCopyProvider } from './workingCopy';
 
 export class MarpCLIError extends Error {}
 
@@ -33,7 +33,7 @@ export class MarpExport {
         const workingCopy = await this.workingCopies.create(file);
 
         try {
-            const argv = this.buildArguments(file, workingCopy.path, type, filesTool);
+            const argv = this.buildArguments(file, workingCopy, type, filesTool);
             const resourcesPath = filesTool.getLibDirectory(file.vault);
             const baseUrl = filesTool.getMarpBaseUrl(file);
             await this.run(argv, resourcesPath, baseUrl);
@@ -44,11 +44,11 @@ export class MarpExport {
 
     private buildArguments(
         file: TFile,
-        workingPath: string,
+        workingCopy: WorkingCopy,
         type: string,
         filesTool: FilePath,
     ): string[] {
-        const argv: string[] = [workingPath, '--allow-local-files'];
+        const argv: string[] = [workingCopy.path, '--allow-local-files'];
         const themePath = filesTool.getThemePath(file);
 
         if (this.settings.EnableMarkdownItPlugins) {
@@ -57,6 +57,9 @@ export class MarpExport {
 
         if (themePath !== '') {
             argv.push('--theme-set', themePath);
+        }
+        if (workingCopy.remoteTheme !== undefined) {
+            argv.push('--theme-set', workingCopy.remoteTheme.path);
         }
 
         switch (type) {

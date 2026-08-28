@@ -39,6 +39,7 @@
 		"fs-extra": "^11.2.0",
 		"gray-matter": "^4.0.3",
 		"jszip": "^3.10.1",
+		"postcss": "^8.5.26",
 		"request": "^2.88.2"
 	}
 }
