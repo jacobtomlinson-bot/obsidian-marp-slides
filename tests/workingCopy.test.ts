@@ -4,6 +4,7 @@ import { tmpdir } from 'os';
 import { App, TFile, Vault } from 'obsidian';
 import { Marp } from '@marp-team/marp-core';
 import marpCli from '@marp-team/marp-cli';
+import postcss from 'postcss';
 import { DEFAULT_SETTINGS } from '../src/utilities/settings';
 import { WorkingCopyManager } from '../src/utilities/workingCopy';
 import { RemoteThemeFetcher } from '../src/utilities/remoteTheme';
@@ -48,6 +49,19 @@ function makeFixture(sourcePath = 'decks/deck.md', content = '# Deck\n\n![[image
     } as unknown as App;
 
     return { absoluteSource, app, content, file };
+}
+
+function hasActiveLocalFileRule(css: string): boolean {
+    let active = false;
+    postcss.parse(css).walkRules(rule => {
+        if (!rule.selector.includes('.evil')) {
+            return;
+        }
+        rule.walkDecls(declaration => {
+            active ||= declaration.value.includes('file:///');
+        });
+    });
+    return active;
 }
 
 test('creates a converted off-vault snapshot and leaves source bytes unchanged', async () => {
@@ -283,6 +297,54 @@ test.each([
     await expect(manager.create(fixture.file)).rejects.toThrow('is not allowed');
     expect(writeSpy.mock.calls.every(call => call[0] !== fixture.absoluteSource)).toBe(true);
     expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
+    await manager.dispose();
+    writeSpy.mockRestore();
+});
+
+test('keeps an escaped-quote data image-set inert through working copy, Core, and CLI', async () => {
+    const payload = 'section{background-image:image-set("data:x\\");} .evil{background:url(file:///tmp/local-secret.png)} .dummy{content:foo(\\"x")}';
+    const content = '---\ntheme: https://themes.example.com/inert.css\n---\n# Inert';
+    const fixture = makeFixture('decks/inert.md', content);
+    await fs.mkdir(join(fixture.absoluteSource, '..'), { recursive: true });
+    const originalBytes = Buffer.from(content, 'utf8');
+    await fs.writeFile(fixture.absoluteSource, originalBytes);
+    const writeSpy = jest.spyOn(fs, 'writeFile');
+    const manager = new WorkingCopyManager(fixture.app, DEFAULT_SETTINGS, {
+        temporaryDirectory: testRoot,
+        fetcher: async url => ({
+            status: 200,
+            headers: { 'content-type': 'text/css' },
+            body: Buffer.from(payload),
+            finalUrl: url,
+        }),
+    });
+
+    const copy = await manager.create(fixture.file);
+    expect(hasActiveLocalFileRule(copy.remoteTheme?.css as string)).toBe(false);
+    const marp = new Marp();
+    marp.themeSet.add(copy.remoteTheme?.css as string);
+    expect(hasActiveLocalFileRule(marp.render(await manager.read(copy)).css)).toBe(false);
+
+    const htmlPath = join(testRoot, 'inert.html');
+    expect(await marpCli([
+        copy.path,
+        '--theme-set',
+        copy.remoteTheme?.path as string,
+        '--allow-local-files',
+        '--html',
+        '-o',
+        htmlPath,
+    ])).toBe(0);
+    const html = await fs.readFile(htmlPath, 'utf8');
+    const styles = [...html.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/g)].map(match => match[1]);
+    expect(styles.length).toBeGreaterThan(0);
+    const themeStyles = styles.filter(style => style.includes('local-secret.png'));
+    expect(themeStyles.length).toBeGreaterThan(0);
+    expect(themeStyles.some(hasActiveLocalFileRule)).toBe(false);
+    expect(writeSpy.mock.calls.every(call => call[0] !== fixture.absoluteSource)).toBe(true);
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(originalBytes);
+
+    await manager.cleanup(copy);
     await manager.dispose();
     writeSpy.mockRestore();
 });

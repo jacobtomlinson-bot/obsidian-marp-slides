@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
+import postcss from 'postcss';
 import {
     fetchRemoteThemeWith,
     findRemoteThemeDirective,
@@ -386,6 +387,22 @@ test('rebases protocol-relative CSS resources and rejects local or executable sc
             'remote-unsafe',
         )).toThrow('is not allowed');
     }
+});
+
+test('preserves an escaped-quote data image-set as one inert string', () => {
+    const payload = 'section{background-image:image-set("data:x\\");} .evil{background:url(file:///tmp/local-secret.png)} .dummy{content:foo(\\"x")}';
+    const prepared = prepareRemoteThemeCss(
+        payload,
+        'https://themes.example.com/theme.css',
+        'remote-inert',
+    );
+    const selectors: string[] = [];
+    postcss.parse(prepared).walkRules(rule => {
+        selectors.push(rule.selector);
+    });
+
+    expect(prepared).toContain(payload);
+    expect(selectors).not.toContain('.evil');
 });
 
 test('strips a UTF-8 BOM and fails closed on refresh errors', async () => {

@@ -2,6 +2,7 @@ import { promises as fs } from 'fs';
 import { dirname, join, resolve, sep } from 'path';
 import { tmpdir } from 'os';
 import { pathToFileURL } from 'url';
+import postcss from 'postcss';
 import { App, TFile, Vault } from 'obsidian';
 import { MarpCliRunner, MarpExport } from '../src/utilities/marpExport';
 import { DEFAULT_SETTINGS, MarpSlidesSettings } from '../src/utilities/settings';
@@ -282,6 +283,35 @@ test.each([
         new MarpExport(fixture.settings, fixture.manager, cli).export(fixture.file, 'html'),
     ).rejects.toThrow('is not allowed');
     expect(cli).not.toHaveBeenCalled();
+    expect(await fs.readFile(fixture.absoluteSource)).toEqual(fixture.originalBytes);
+    await fixture.manager.dispose();
+});
+
+test('exports an escaped-quote data image-set without activating its inert file text', async () => {
+    const payload = 'section{background-image:image-set("data:x\\");} .evil{background:url(file:///tmp/local-secret.png)} .dummy{content:foo(\\"x")}';
+    const source = '---\ntheme: https://cdn.example.com/inert.css\n---\n# Inert';
+    const fixture = await makeFixture('relative', source, {
+        fetcher: async url => ({
+            status: 200,
+            headers: { 'content-type': 'text/css' },
+            body: Buffer.from(payload),
+            finalUrl: url,
+        }),
+    });
+    const cli: MarpCliRunner = jest.fn(async argv => {
+        const themePath = argv[argv.lastIndexOf('--theme-set') + 1];
+        let active = false;
+        postcss.parse(await fs.readFile(themePath, 'utf8')).walkRules(rule => {
+            if (rule.selector.includes('.evil')) {
+                active = true;
+            }
+        });
+        expect(active).toBe(false);
+        return 0;
+    });
+
+    await new MarpExport(fixture.settings, fixture.manager, cli).export(fixture.file, 'html');
+    expect(cli).toHaveBeenCalledTimes(1);
     expect(await fs.readFile(fixture.absoluteSource)).toEqual(fixture.originalBytes);
     await fixture.manager.dispose();
 });

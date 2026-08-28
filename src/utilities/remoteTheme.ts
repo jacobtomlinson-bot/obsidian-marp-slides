@@ -465,7 +465,13 @@ function rebaseImageSetStrings(node: CssFunctionNode, baseUrl: string): void {
         startsAlternative = false;
         if (child.type === 'string') {
             const reference = decodeCssEscapes(child.value);
-            child.value = rebaseReference(reference, baseUrl);
+            const rebased = rebaseReference(reference, baseUrl);
+            if (rebased !== reference) {
+                child.value = rebased
+                    .replace(/\\/g, '\\\\')
+                    .replace(new RegExp(child.quote, 'g'), `\\${child.quote}`)
+                    .replace(/\r\n|[\n\f\r]/g, character => `\\${character.codePointAt(0)?.toString(16)} `);
+            }
         }
     }
 }
@@ -534,8 +540,10 @@ function rebaseImport(params: string, baseUrl: string): string {
     return valueParser.stringify(parsed.nodes);
 }
 
-export function prepareRemoteThemeCss(css: string, finalUrl: string, themeName: string): string {
-    const root = postcss.parse(css, { from: finalUrl });
+function rewriteRemoteThemeResources(
+    root: ReturnType<typeof postcss.parse>,
+    finalUrl: string,
+): void {
     root.walkDecls(declaration => {
         declaration.value = rebaseUrlFunctions(declaration.value, finalUrl);
     });
@@ -544,8 +552,23 @@ export function prepareRemoteThemeCss(css: string, finalUrl: string, themeName: 
             ? rebaseImport(rule.params, finalUrl)
             : rebaseUrlFunctions(rule.params, finalUrl);
     });
+}
+
+export function prepareRemoteThemeCss(css: string, finalUrl: string, themeName: string): string {
+    const root = postcss.parse(css, { from: finalUrl });
+    rewriteRemoteThemeResources(root, finalUrl);
     root.append({ text: `@theme ${themeName}` });
-    return root.toString();
+    const prepared = root.toString();
+    try {
+        const verificationRoot = postcss.parse(prepared, { from: finalUrl });
+        rewriteRemoteThemeResources(verificationRoot, finalUrl);
+    } catch (error) {
+        if (error instanceof RemoteThemeError) {
+            throw error;
+        }
+        throw new RemoteThemeError('Remote theme CSS could not be serialized safely.', error);
+    }
+    return prepared;
 }
 
 function parseCachePolicy(
